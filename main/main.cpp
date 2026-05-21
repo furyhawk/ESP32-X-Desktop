@@ -14,8 +14,6 @@
 
 #define TAG "main"
 
-#define Brightness_Test_EN  1
-
 I2cMasterBus user_i2cbus(7,8,0); //scl,sda,i2c_port
 DisplayPort *user_display = NULL;
 
@@ -29,6 +27,10 @@ typedef struct {
 static desktop_widgets_t desktop_widgets = {};
 static pcf85063a_dev_t rtc_dev;
 static bool rtc_ready = false;
+static uint8_t desktop_brightness = 100;
+
+static lv_obj_t *settings_panel = NULL;
+static lv_obj_t *brightness_value_label = NULL;
 
 static const char *desktop_battery_symbol(int battery_percent, bool is_charging)
 {
@@ -111,6 +113,47 @@ static void desktop_refresh(lv_timer_t *timer)
     lv_label_set_text(desktop_widgets.status_label, status_text);
 }
 
+static void desktop_set_brightness(uint8_t brightness)
+{
+    desktop_brightness = brightness;
+    user_display->Set_Backlight(desktop_brightness);
+
+    if(brightness_value_label != NULL) {
+        char value_text[8] = {0};
+        snprintf(value_text, sizeof(value_text), "%u%%", desktop_brightness);
+        lv_label_set_text(brightness_value_label, value_text);
+    }
+}
+
+static void desktop_settings_close_event(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    if(settings_panel != NULL) {
+        lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void desktop_settings_open_event(lv_event_t *e)
+{
+    LV_UNUSED(e);
+    if(settings_panel != NULL) {
+        lv_obj_clear_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void desktop_brightness_slider_event(lv_event_t *e)
+{
+    lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+    int32_t slider_value = lv_slider_get_value(slider);
+    if(slider_value < 0) {
+        slider_value = 0;
+    }
+    if(slider_value > 100) {
+        slider_value = 100;
+    }
+    desktop_set_brightness((uint8_t)slider_value);
+}
+
 static void desktop_create_ui(void)
 {
     lv_obj_t *screen = lv_obj_create(NULL);
@@ -169,7 +212,64 @@ static void desktop_create_ui(void)
     lv_obj_align(desktop_widgets.status_label, LV_ALIGN_BOTTOM_LEFT, 8, -4);
     lv_obj_set_style_text_color(desktop_widgets.status_label, lv_color_hex(0xD6E4FF), 0);
 
+    lv_obj_t *settings_button = lv_btn_create(screen);
+    lv_obj_align(settings_button, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_set_size(settings_button, 140, 48);
+    lv_obj_set_style_radius(settings_button, 20, 0);
+    lv_obj_set_style_bg_color(settings_button, lv_color_hex(0x213A66), 0);
+    lv_obj_add_event_cb(settings_button, desktop_settings_open_event, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *settings_button_label = lv_label_create(settings_button);
+    lv_label_set_text(settings_button_label, LV_SYMBOL_SETTINGS " Settings");
+    lv_obj_set_style_text_color(settings_button_label, lv_color_hex(0xF0F5FF), 0);
+    lv_obj_center(settings_button_label);
+
+    settings_panel = lv_obj_create(screen);
+    lv_obj_set_size(settings_panel, 420, 220);
+    lv_obj_align(settings_panel, LV_ALIGN_CENTER, 0, 26);
+    lv_obj_set_style_bg_color(settings_panel, lv_color_hex(0x0E1D36), 0);
+    lv_obj_set_style_bg_opa(settings_panel, LV_OPA_90, 0);
+    lv_obj_set_style_radius(settings_panel, 26, 0);
+    lv_obj_set_style_border_width(settings_panel, 0, 0);
+    lv_obj_set_style_pad_all(settings_panel, 18, 0);
+    lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *settings_title = lv_label_create(settings_panel);
+    lv_label_set_text(settings_title, "Display Settings");
+    lv_obj_set_style_text_color(settings_title, lv_color_hex(0xF7FAFF), 0);
+    lv_obj_set_style_text_font(settings_title, &lv_font_montserrat_20, 0);
+    lv_obj_align(settings_title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *close_button = lv_btn_create(settings_panel);
+    lv_obj_set_size(close_button, 40, 40);
+    lv_obj_align(close_button, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_style_radius(close_button, 20, 0);
+    lv_obj_set_style_bg_color(close_button, lv_color_hex(0x2C487A), 0);
+    lv_obj_add_event_cb(close_button, desktop_settings_close_event, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *close_label = lv_label_create(close_button);
+    lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+    lv_obj_center(close_label);
+
+    lv_obj_t *brightness_title = lv_label_create(settings_panel);
+    lv_label_set_text(brightness_title, "Brightness");
+    lv_obj_set_style_text_color(brightness_title, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_align(brightness_title, LV_ALIGN_TOP_LEFT, 0, 64);
+
+    brightness_value_label = lv_label_create(settings_panel);
+    lv_label_set_text(brightness_value_label, "100%");
+    lv_obj_set_style_text_color(brightness_value_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(brightness_value_label, LV_ALIGN_TOP_RIGHT, 0, 64);
+
+    lv_obj_t *brightness_slider = lv_slider_create(settings_panel);
+    lv_obj_set_width(brightness_slider, lv_pct(100));
+    lv_obj_align(brightness_slider, LV_ALIGN_TOP_MID, 0, 106);
+    lv_slider_set_range(brightness_slider, 0, 100);
+    lv_slider_set_value(brightness_slider, desktop_brightness, LV_ANIM_OFF);
+    lv_obj_add_event_cb(brightness_slider, desktop_brightness_slider_event, LV_EVENT_VALUE_CHANGED, NULL);
+
     lv_screen_load(screen);
+    desktop_set_brightness(desktop_brightness);
     desktop_refresh(NULL);
     lv_timer_create(desktop_refresh, 1000, NULL);
 }
@@ -187,26 +287,6 @@ static void desktop_init_rtc(void)
     ESP_LOGW(TAG, "Failed to initialize PCF85063 (error: %d)", ret);
 }
 
-#if (Brightness_Test_EN == 1) 
-
-void Brightness_Test(void *arg) {
-    uint8_t back = 100;
-    while(1) {
-        if(Lvgl_lock(-1) == ESP_OK) {
-		    user_display->Set_Backlight(back);
-            Lvgl_unlock();
-  	    }
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        if(back > 0) {
-            back = back - 20;
-        } else {
-            back = 100;
-        }
-    }
-}
-
-#endif
-
 extern "C" void app_main(void)
 {
     Custom_PmicPortInit(&user_i2cbus,0x34);
@@ -218,7 +298,4 @@ extern "C" void app_main(void)
 		desktop_create_ui();
     	Lvgl_unlock();
   	}
-#if (Brightness_Test_EN == 1) 
-    xTaskCreatePinnedToCore(Brightness_Test, "Brightness_Test", 3 * 1024, NULL, 3, NULL,0);
-#endif
 }
