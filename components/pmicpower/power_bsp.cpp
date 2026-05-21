@@ -131,3 +131,19 @@ void Axp2101_SetAldo2(uint8_t vol) {
         axp2101.disableALDO2();
     }
 }
+
+int Axp2101_GetBatteryPercent(void) {
+    return axp2101.getBatteryPercent();
+}
+
+uint16_t Axp2101_GetBatteryVoltageMv(void) {
+    return axp2101.getBattVoltage();
+}
+
+bool Axp2101_IsBatteryConnected(void) {
+    return axp2101.isBatteryConnect();
+}
+
+bool Axp2101_IsCharging(void) {
+    return axp2101.isCharging();
+}
