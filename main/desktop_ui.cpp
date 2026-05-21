@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -27,6 +29,7 @@ static DisplayPort *desktop_display = NULL;
 static pcf85063a_dev_t rtc_dev;
 static bool rtc_ready = false;
 static uint8_t desktop_brightness = 100;
+static const char *SINGAPORE_TZ = "SGT-8";
 
 static lv_obj_t *settings_panel = NULL;
 static lv_obj_t *brightness_value_label = NULL;
@@ -78,6 +81,108 @@ static void desktop_read_time(char *time_text, size_t time_text_size, char *date
              (unsigned long)minutes,
              (unsigned long)seconds);
     snprintf(date_text, date_text_size, "RTC unavailable");
+}
+
+static void desktop_set_singapore_timezone(void)
+{
+    setenv("TZ", SINGAPORE_TZ, 1);
+    tzset();
+}
+
+esp_err_t DesktopUI_SyncSystemTimeFromRtc(void)
+{
+    if(!rtc_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    pcf85063a_datetime_t date_time = {};
+    esp_err_t ret = pcf85063a_get_time_date(&rtc_dev, &date_time);
+    if(ret != ESP_OK) {
+        rtc_ready = false;
+        ESP_LOGW(TAG, "Failed to read RTC while seeding system time (error: %d)", ret);
+        return ret;
+    }
+
+    desktop_set_singapore_timezone();
+
+    struct tm local_time = {};
+    local_time.tm_year = (int)date_time.year - 1900;
+    local_time.tm_mon = (int)date_time.month - 1;
+    local_time.tm_mday = (int)date_time.day;
+    local_time.tm_hour = (int)date_time.hour;
+    local_time.tm_min = (int)date_time.min;
+    local_time.tm_sec = (int)date_time.sec;
+    local_time.tm_wday = (int)date_time.dotw;
+    local_time.tm_isdst = 0;
+
+    time_t epoch = mktime(&local_time);
+    if(epoch == (time_t)-1) {
+        ESP_LOGW(TAG, "RTC contained an invalid local time, skipping system clock seed");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    struct timeval now = {
+        .tv_sec = epoch,
+        .tv_usec = 0,
+    };
+
+    if(settimeofday(&now, NULL) != 0) {
+        ESP_LOGE(TAG, "Failed to seed system time from RTC");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Seeded system clock from RTC: %04u-%02u-%02u %02u:%02u:%02u",
+             date_time.year,
+             date_time.month,
+             date_time.day,
+             date_time.hour,
+             date_time.min,
+             date_time.sec);
+    return ESP_OK;
+}
+
+esp_err_t DesktopUI_SyncRtcFromSystemTime(void)
+{
+    if(!rtc_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    desktop_set_singapore_timezone();
+
+    time_t now = time(NULL);
+    if(now <= 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    struct tm local_time = {};
+    if(localtime_r(&now, &local_time) == NULL) {
+        return ESP_FAIL;
+    }
+
+    pcf85063a_datetime_t date_time = {
+        .year = (uint16_t)(local_time.tm_year + 1900),
+        .month = (uint8_t)(local_time.tm_mon + 1),
+        .day = (uint8_t)local_time.tm_mday,
+        .dotw = (uint8_t)local_time.tm_wday,
+        .hour = (uint8_t)local_time.tm_hour,
+        .min = (uint8_t)local_time.tm_min,
+        .sec = (uint8_t)local_time.tm_sec,
+    };
+
+    esp_err_t ret = pcf85063a_set_time_date(&rtc_dev, date_time);
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to update RTC from system time (error: %d)", ret);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "RTC updated from synced local time: %04u-%02u-%02u %02u:%02u:%02u",
+             date_time.year,
+             date_time.month,
+             date_time.day,
+             date_time.hour,
+             date_time.min,
+             date_time.sec);
+    return ESP_OK;
 }
 
 static void desktop_refresh(lv_timer_t *timer)
@@ -305,6 +410,7 @@ void DesktopUI_Init(I2cMasterBus *i2c_bus, DisplayPort *display)
 {
     desktop_display = display;
     desktop_init_rtc(i2c_bus);
+    DesktopUI_SyncSystemTimeFromRtc();
     desktop_create_ui();
 }
 

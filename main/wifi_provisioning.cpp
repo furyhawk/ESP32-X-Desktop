@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -7,12 +9,14 @@
 #include <esp_event.h>
 #include <esp_log.h>
 #include <esp_netif.h>
+#include <esp_netif_sntp.h>
 #include <esp_wifi.h>
 #include <nvs_flash.h>
 
 #include <network_provisioning/manager.h>
 #include <network_provisioning/scheme_softap.h>
 
+#include "desktop_ui.h"
 #include "wifi_provisioning.h"
 
 #define TAG "wifi_prov"
@@ -24,8 +28,10 @@ static EventGroupHandle_t wifi_event_group;
 static const int WIFI_CONNECTED_EVENT = BIT0;
 static bool wifi_bootstrap_done = false;
 static bool wifi_is_provisioning = false;
+static bool wifi_sntp_initialized = false;
 static char prov_service_name[20] = {0};
 static char prov_qr_payload[200] = {0};
+static const char *SINGAPORE_TZ = "SGT-8";
 
 /* Security-2 development credentials copied from Espressif provisioning example. */
 static const char sec2_salt[] = {
@@ -59,6 +65,55 @@ static const char sec2_verifier[] = {
     0xb3, 0xbe, 0x40, 0xc5, 0xc5, 0x32, 0x29, 0x3e, 0x71, 0x64, 0x9e, 0xde, 0x8c, 0xf6, 0x75, 0xa1,
     0xe6, 0xf6, 0x53, 0xc8, 0x31, 0xa8, 0x78, 0xde, 0x50, 0x40, 0xf7, 0x62, 0xde, 0x36, 0xb2, 0xba
 };
+
+static void wifi_set_singapore_timezone(void)
+{
+    setenv("TZ", SINGAPORE_TZ, 1);
+    tzset();
+}
+
+static void wifi_time_sync_cb(struct timeval *tv)
+{
+    (void)tv;
+
+    wifi_set_singapore_timezone();
+
+    esp_err_t ret = DesktopUI_SyncRtcFromSystemTime();
+    if(ret == ESP_OK) {
+        ESP_LOGI(TAG, "SNTP sync completed and RTC updated for Singapore local time");
+    } else if(ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SNTP sync completed, but RTC update failed (error: %d)", ret);
+    }
+}
+
+static void wifi_start_time_sync(void)
+{
+    wifi_set_singapore_timezone();
+
+    if(!wifi_sntp_initialized) {
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("time.google.com");
+        sntp_cfg.wait_for_sync = false;
+        sntp_cfg.sync_cb = wifi_time_sync_cb;
+
+        esp_err_t ret = esp_netif_sntp_init(&sntp_cfg);
+        if(ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to initialize SNTP (error: %d)", ret);
+            return;
+        }
+
+        wifi_sntp_initialized = true;
+        ESP_LOGI(TAG, "SNTP initialized using Singapore local time");
+        return;
+    }
+
+    esp_err_t ret = esp_netif_sntp_start();
+    if(ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to restart SNTP after reconnect (error: %d)", ret);
+        return;
+    }
+
+    ESP_LOGI(TAG, "SNTP restart requested after Wi-Fi reconnect");
+}
 
 static void wifi_init_sta(void)
 {
@@ -130,6 +185,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Connected with IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+        wifi_start_time_sync();
     }
 }
 
@@ -138,6 +194,8 @@ esp_err_t WifiProvisioning_Bootstrap(void)
     if(wifi_bootstrap_done) {
         return ESP_OK;
     }
+
+    wifi_set_singapore_timezone();
 
     esp_err_t ret = nvs_flash_init();
     if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
