@@ -9,6 +9,8 @@
 
 #include "power_bsp.h"
 #include "desktop_ui.h"
+#include "libs/qrcode/lv_qrcode.h"
+#include "wifi_provisioning.h"
 
 #define TAG "desktop_ui"
 
@@ -28,6 +30,8 @@ static uint8_t desktop_brightness = 100;
 
 static lv_obj_t *settings_panel = NULL;
 static lv_obj_t *brightness_value_label = NULL;
+static lv_obj_t *desktop_screen = NULL;
+static lv_obj_t *prov_screen   = NULL;
 
 static const char *desktop_battery_symbol(int battery_percent, bool is_charging)
 {
@@ -79,6 +83,15 @@ static void desktop_read_time(char *time_text, size_t time_text_size, char *date
 static void desktop_refresh(lv_timer_t *timer)
 {
     LV_UNUSED(timer);
+
+    /* Auto-dismiss provisioning screen once provisioning completes */
+    if(prov_screen != NULL && !WifiProvisioning_IsProvisioning()) {
+        lv_obj_delete(prov_screen);
+        prov_screen = NULL;
+        if(desktop_screen != NULL) {
+            lv_screen_load(desktop_screen);
+        }
+    }
 
     char time_text[16] = {0};
     char date_text[24] = {0};
@@ -285,6 +298,7 @@ static void desktop_create_ui(void)
     desktop_set_brightness(desktop_brightness);
     desktop_refresh(NULL);
     lv_timer_create(desktop_refresh, 1000, NULL);
+    desktop_screen = screen;
 }
 
 void DesktopUI_Init(I2cMasterBus *i2c_bus, DisplayPort *display)
@@ -292,4 +306,46 @@ void DesktopUI_Init(I2cMasterBus *i2c_bus, DisplayPort *display)
     desktop_display = display;
     desktop_init_rtc(i2c_bus);
     desktop_create_ui();
+}
+
+void DesktopUI_ShowProvisioningQR(const char *service_name, const char *service_key, const char *qr_payload)
+{
+    prov_screen = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(prov_screen, lv_color_hex(0x0B1020), 0);
+    lv_obj_set_style_pad_all(prov_screen, 16, 0);
+
+    /* Title */
+    lv_obj_t *title = lv_label_create(prov_screen);
+    lv_label_set_text(title, LV_SYMBOL_WIFI "  Wi-Fi Setup");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+    /* QR code — enlarged for easier scanning on-device */
+    lv_obj_t *qr = lv_qrcode_create(prov_screen);
+    lv_qrcode_set_size(qr, 280);
+    lv_qrcode_set_dark_color(qr, lv_color_black());
+    lv_qrcode_set_light_color(qr, lv_color_white());
+    lv_qrcode_update(qr, qr_payload, (uint32_t)strlen(qr_payload));
+    lv_obj_align(qr, LV_ALIGN_CENTER, 0, -4);
+
+    /* Instruction row: connect info */
+    char connect_text[64] = {0};
+    snprintf(connect_text, sizeof(connect_text), "SSID: %s  |  Pass: %s", service_name, service_key);
+    lv_obj_t *connect_label = lv_label_create(prov_screen);
+    lv_label_set_text(connect_label, connect_text);
+    lv_obj_set_style_text_color(connect_label, lv_color_hex(0xB8CAE6), 0);
+    lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_width(connect_label, 440);
+    lv_label_set_long_mode(connect_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(connect_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(connect_label, LV_ALIGN_BOTTOM_MID, 0, -34);
+
+    lv_obj_t *hint_label = lv_label_create(prov_screen);
+    lv_label_set_text(hint_label, "Scan with Espressif Provisioning app");
+    lv_obj_set_style_text_color(hint_label, lv_color_hex(0x7A9DC4), 0);
+    lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    lv_screen_load(prov_screen);
 }

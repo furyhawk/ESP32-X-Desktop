@@ -13,8 +13,6 @@ DisplayPort *user_display = NULL;
 
 extern "C" void app_main(void)
 {
-    ESP_ERROR_CHECK(WifiProvisioning_Bootstrap());
-
     Custom_PmicPortInit(&user_i2cbus,0x34);
 
     user_display = new DisplayPort(user_i2cbus,480,480);
@@ -24,5 +22,18 @@ extern "C" void app_main(void)
     if(Lvgl_lock(-1) == ESP_OK) {
         DesktopUI_Init(&user_i2cbus, user_display);
         Lvgl_unlock();
+    }
+
+    ESP_ERROR_CHECK(WifiProvisioning_Bootstrap());
+
+    if(WifiProvisioning_IsProvisioning()) {
+        char svc_name[20]    = {0};
+        char qr_payload[200] = {0};
+        WifiProvisioning_GetServiceName(svc_name, sizeof(svc_name));
+        WifiProvisioning_GetQRPayload(qr_payload, sizeof(qr_payload));
+        if(Lvgl_lock(-1) == ESP_OK) {
+            DesktopUI_ShowProvisioningQR(svc_name, "prov1234", qr_payload);
+            Lvgl_unlock();
+        }
     }
 }

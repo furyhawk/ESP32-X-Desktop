@@ -23,6 +23,9 @@
 static EventGroupHandle_t wifi_event_group;
 static const int WIFI_CONNECTED_EVENT = BIT0;
 static bool wifi_bootstrap_done = false;
+static bool wifi_is_provisioning = false;
+static char prov_service_name[20] = {0};
+static char prov_qr_payload[200] = {0};
 
 /* Security-2 development credentials copied from Espressif provisioning example. */
 static const char sec2_salt[] = {
@@ -72,12 +75,11 @@ static void get_device_service_name(char *service_name, size_t max_len)
 
 static void wifi_prov_print_url(const char *name, const char *username, const char *pop)
 {
-    char payload[180] = {0};
-    snprintf(payload, sizeof(payload),
+    snprintf(prov_qr_payload, sizeof(prov_qr_payload),
              "{\"ver\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\"}",
              PROV_QR_VERSION, name, username, pop, PROV_TRANSPORT_SOFTAP);
 
-    ESP_LOGI(TAG, "Provisioning URL:\n%s?data=%s", QRCODE_BASE_URL, payload);
+    ESP_LOGI(TAG, "Provisioning URL:\n%s?data=%s", QRCODE_BASE_URL, prov_qr_payload);
 }
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -101,6 +103,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         case NETWORK_PROV_END:
             ESP_LOGI(TAG, "Provisioning ended, deinitializing manager");
             ESP_ERROR_CHECK(network_prov_mgr_deinit());
+                        wifi_is_provisioning = false;
             break;
         default:
             break;
@@ -175,6 +178,7 @@ esp_err_t WifiProvisioning_Bootstrap(void)
         network_prov_security2_params_t sec2_params = {};
 
         get_device_service_name(service_name, sizeof(service_name));
+    strncpy(prov_service_name, service_name, sizeof(prov_service_name) - 1);
 
         sec2_params.salt = sec2_salt;
         sec2_params.salt_len = sizeof(sec2_salt);
@@ -187,6 +191,7 @@ esp_err_t WifiProvisioning_Bootstrap(void)
                                                             service_name,
                                                             service_key));
         wifi_prov_print_url(service_name, username, pop);
+        wifi_is_provisioning = true;
     } else {
         ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
         ESP_ERROR_CHECK(network_prov_mgr_deinit());
@@ -195,4 +200,21 @@ esp_err_t WifiProvisioning_Bootstrap(void)
 
     wifi_bootstrap_done = true;
     return ESP_OK;
+}
+
+bool WifiProvisioning_IsProvisioning(void)
+{
+    return wifi_is_provisioning;
+}
+
+void WifiProvisioning_GetServiceName(char *buf, size_t len)
+{
+    strncpy(buf, prov_service_name, len - 1);
+    buf[len - 1] = '\0';
+}
+
+void WifiProvisioning_GetQRPayload(char *buf, size_t len)
+{
+    strncpy(buf, prov_qr_payload, len - 1);
+    buf[len - 1] = '\0';
 }

@@ -58,10 +58,10 @@ static void bsp_lvgl_rounder_cb(lv_disp_drv_t *disp_drv, lv_area_t *area)
 
 esp_err_t Lvgl_PortInit(DisplayPort &display) {
 	esp_lv_adapter_config_t cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
-	cfg.task_stack_size = 20 * 1024;     // 栈大小改为16KB，彻底解决栈溢出
-    cfg.task_priority = 10;              // 优先级提升到10，解决UI卡顿
-    cfg.task_core_id = 0;                // 强制绑定到Core 0，最关键优化！
-    cfg.stack_in_psram = false;          // 可选：栈空间分配到PSRAM(有PSRAM必开)
+	cfg.task_stack_size = 8 * 1024;
+    cfg.task_priority = 10;
+    cfg.task_core_id = 0;
+    cfg.stack_in_psram = false;
 
     esp_err_t ret = esp_lv_adapter_init(&cfg);
     if(ret != ESP_OK) {
