@@ -27,8 +27,10 @@
 static EventGroupHandle_t wifi_event_group;
 static const int WIFI_CONNECTED_EVENT = BIT0;
 static bool wifi_bootstrap_done = false;
+static bool wifi_mgr_initialized = false;
 static bool wifi_is_provisioning = false;
 static bool wifi_sntp_initialized = false;
+static bool wifi_is_connected = false;
 static char prov_service_name[20] = {0};
 static char prov_qr_payload[200] = {0};
 static const char *SINGAPORE_TZ = "SGT-8";
@@ -137,6 +139,58 @@ static void wifi_prov_print_url(const char *name, const char *username, const ch
     ESP_LOGI(TAG, "Provisioning URL:\n%s?data=%s", QRCODE_BASE_URL, prov_qr_payload);
 }
 
+static esp_err_t wifi_prov_manager_init_if_needed(void)
+{
+    if(wifi_mgr_initialized) {
+        return ESP_OK;
+    }
+
+    network_prov_mgr_config_t prov_cfg = {};
+    prov_cfg.scheme = network_prov_scheme_softap;
+    prov_cfg.scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE;
+
+    esp_err_t ret = network_prov_mgr_init(prov_cfg);
+    if(ret != ESP_OK) {
+        return ret;
+    }
+
+    wifi_mgr_initialized = true;
+    return ESP_OK;
+}
+
+static esp_err_t wifi_start_softap_provisioning(void)
+{
+    char service_name[16] = {0};
+    const char *username = "wifiprov";
+    const char *pop = "abcd1234";
+    const char *service_key = "prov1234";
+    network_prov_security2_params_t sec2_params = {};
+
+    get_device_service_name(service_name, sizeof(service_name));
+    strncpy(prov_service_name, service_name, sizeof(prov_service_name) - 1);
+    prov_service_name[sizeof(prov_service_name) - 1] = '\0';
+
+    sec2_params.salt = sec2_salt;
+    sec2_params.salt_len = sizeof(sec2_salt);
+    sec2_params.verifier = sec2_verifier;
+    sec2_params.verifier_len = sizeof(sec2_verifier);
+
+    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s)", service_name);
+    esp_err_t ret = network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_2,
+                                                        (const void *)&sec2_params,
+                                                        service_name,
+                                                        service_key);
+    if(ret != ESP_OK) {
+        return ret;
+    }
+
+    wifi_prov_print_url(service_name, username, pop);
+    wifi_is_provisioning = true;
+    wifi_is_connected = false;
+    xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+    return ESP_OK;
+}
+
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if(event_base == NETWORK_PROV_EVENT) {
@@ -158,7 +212,8 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         case NETWORK_PROV_END:
             ESP_LOGI(TAG, "Provisioning ended, deinitializing manager");
             ESP_ERROR_CHECK(network_prov_mgr_deinit());
-                        wifi_is_provisioning = false;
+            wifi_mgr_initialized = false;
+            wifi_is_provisioning = false;
             break;
         default:
             break;
@@ -170,6 +225,8 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
             ESP_LOGI(TAG, "Wi-Fi disconnected, retrying...");
+            wifi_is_connected = false;
+            xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_EVENT);
             esp_wifi_connect();
             break;
         case WIFI_EVENT_AP_STACONNECTED:
@@ -184,6 +241,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     } else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Connected with IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        wifi_is_connected = true;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
         wifi_start_time_sync();
     }
@@ -220,39 +278,17 @@ esp_err_t WifiProvisioning_Bootstrap(void)
     wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
 
-    network_prov_mgr_config_t prov_cfg = {};
-    prov_cfg.scheme = network_prov_scheme_softap;
-    prov_cfg.scheme_event_handler = NETWORK_PROV_EVENT_HANDLER_NONE;
-    ESP_ERROR_CHECK(network_prov_mgr_init(prov_cfg));
+    ESP_ERROR_CHECK(wifi_prov_manager_init_if_needed());
 
     bool provisioned = false;
     ESP_ERROR_CHECK(network_prov_mgr_is_wifi_provisioned(&provisioned));
 
     if(!provisioned) {
-        char service_name[16] = {0};
-        const char *username = "wifiprov";
-        const char *pop = "abcd1234";
-        const char *service_key = "prov1234";
-        network_prov_security2_params_t sec2_params = {};
-
-        get_device_service_name(service_name, sizeof(service_name));
-    strncpy(prov_service_name, service_name, sizeof(prov_service_name) - 1);
-
-        sec2_params.salt = sec2_salt;
-        sec2_params.salt_len = sizeof(sec2_salt);
-        sec2_params.verifier = sec2_verifier;
-        sec2_params.verifier_len = sizeof(sec2_verifier);
-
-        ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s)", service_name);
-        ESP_ERROR_CHECK(network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_2,
-                                                            (const void *)&sec2_params,
-                                                            service_name,
-                                                            service_key));
-        wifi_prov_print_url(service_name, username, pop);
-        wifi_is_provisioning = true;
+        ESP_ERROR_CHECK(wifi_start_softap_provisioning());
     } else {
         ESP_LOGI(TAG, "Already provisioned, starting Wi-Fi STA");
         ESP_ERROR_CHECK(network_prov_mgr_deinit());
+        wifi_mgr_initialized = false;
         wifi_init_sta();
     }
 
@@ -260,9 +296,59 @@ esp_err_t WifiProvisioning_Bootstrap(void)
     return ESP_OK;
 }
 
+esp_err_t WifiProvisioning_Reprovision(void)
+{
+    if(!wifi_bootstrap_done) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if(wifi_is_provisioning) {
+        return ESP_OK;
+    }
+
+    esp_err_t ret = wifi_prov_manager_init_if_needed();
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize provisioning manager for reprovisioning (error: %d)", ret);
+        return ret;
+    }
+
+    ret = network_prov_mgr_reset_wifi_provisioning();
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to reset Wi-Fi provisioning credentials (error: %d)", ret);
+        return ret;
+    }
+
+    ret = esp_wifi_stop();
+    if(ret != ESP_OK && ret != ESP_ERR_WIFI_NOT_STOPPED) {
+        ESP_LOGE(TAG, "Failed to stop Wi-Fi before reprovisioning (error: %d)", ret);
+        return ret;
+    }
+
+    return wifi_start_softap_provisioning();
+}
+
 bool WifiProvisioning_IsProvisioning(void)
 {
     return wifi_is_provisioning;
+}
+
+void WifiProvisioning_GetConnectionStatus(char *buf, size_t len)
+{
+    if(buf == NULL || len == 0) {
+        return;
+    }
+
+    if(!wifi_bootstrap_done) {
+        strncpy(buf, "Wi-Fi: Initializing", len - 1);
+    } else if(wifi_is_provisioning) {
+        strncpy(buf, "Wi-Fi: Provisioning", len - 1);
+    } else if(wifi_is_connected) {
+        strncpy(buf, "Wi-Fi: Connected", len - 1);
+    } else {
+        strncpy(buf, "Wi-Fi: Connecting", len - 1);
+    }
+
+    buf[len - 1] = '\0';
 }
 
 void WifiProvisioning_GetServiceName(char *buf, size_t len)

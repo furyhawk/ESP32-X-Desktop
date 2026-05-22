@@ -6,8 +6,14 @@
 
 esp_err_t WifiProvisioning_Bootstrap(void);
 
+/** Clears saved Wi-Fi credentials and starts SoftAP provisioning again. */
+esp_err_t WifiProvisioning_Reprovision(void);
+
 /** Returns true if SoftAP provisioning is currently active (device not yet provisioned). */
 bool WifiProvisioning_IsProvisioning(void);
+
+/** Writes a short Wi-Fi connection status string for UI display. */
+void WifiProvisioning_GetConnectionStatus(char *buf, size_t len);
 
 /** Fills buf with the service name (e.g. "PROV_AABBCC"). */
 void WifiProvisioning_GetServiceName(char *buf, size_t len);

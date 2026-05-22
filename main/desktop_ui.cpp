@@ -201,7 +201,9 @@ static void desktop_refresh(lv_timer_t *timer)
     char time_text[16] = {0};
     char date_text[24] = {0};
     char battery_text[48] = {0};
-    char status_text[48] = {0};
+    char status_text[80] = {0};
+    char wifi_text[32] = {0};
+    char power_text[40] = {0};
 
     desktop_read_time(time_text, sizeof(time_text), date_text, sizeof(date_text));
 
@@ -215,12 +217,15 @@ static void desktop_refresh(lv_timer_t *timer)
                  desktop_battery_symbol(battery_percent, is_charging),
                  battery_percent,
                  battery_voltage_mv);
-        snprintf(status_text, sizeof(status_text), "%s", is_charging ? "Charging" : "Battery power");
+        snprintf(power_text, sizeof(power_text), "%s", is_charging ? "Charging" : "Battery power");
     } else {
         snprintf(battery_text, sizeof(battery_text), "%s External power",
                  is_charging ? LV_SYMBOL_CHARGE : LV_SYMBOL_BATTERY_EMPTY);
-        snprintf(status_text, sizeof(status_text), "%s", rtc_ready ? "Standby" : "Standby · uptime clock");
+        snprintf(power_text, sizeof(power_text), "%s", rtc_ready ? "Standby" : "Standby · uptime clock");
     }
+
+    WifiProvisioning_GetConnectionStatus(wifi_text, sizeof(wifi_text));
+    snprintf(status_text, sizeof(status_text), "%s | %s", wifi_text, power_text);
 
     lv_label_set_text(desktop_widgets.time_label, time_text);
     lv_label_set_text(desktop_widgets.date_label, date_text);
@@ -270,6 +275,28 @@ static void desktop_brightness_slider_event(lv_event_t *e)
         slider_value = 100;
     }
     desktop_set_brightness((uint8_t)slider_value);
+}
+
+static void desktop_wifi_setup_event(lv_event_t *e)
+{
+    LV_UNUSED(e);
+
+    esp_err_t ret = WifiProvisioning_Reprovision();
+    if(ret != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to start Wi-Fi reprovisioning (error: %d)", ret);
+        return;
+    }
+
+    char svc_name[20] = {0};
+    char qr_payload[200] = {0};
+    WifiProvisioning_GetServiceName(svc_name, sizeof(svc_name));
+    WifiProvisioning_GetQRPayload(qr_payload, sizeof(qr_payload));
+
+    if(settings_panel != NULL) {
+        lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    DesktopUI_ShowProvisioningQR(svc_name, "prov1234", qr_payload);
 }
 
 static void desktop_init_rtc(I2cMasterBus *i2c_bus)
@@ -356,7 +383,7 @@ static void desktop_create_ui(void)
     lv_obj_center(settings_button_label);
 
     settings_panel = lv_obj_create(screen);
-    lv_obj_set_size(settings_panel, 420, 220);
+    lv_obj_set_size(settings_panel, 420, 300);
     lv_obj_align(settings_panel, LV_ALIGN_CENTER, 0, 26);
     lv_obj_set_style_bg_color(settings_panel, lv_color_hex(0x0E1D36), 0);
     lv_obj_set_style_bg_opa(settings_panel, LV_OPA_90, 0);
@@ -366,7 +393,7 @@ static void desktop_create_ui(void)
     lv_obj_add_flag(settings_panel, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *settings_title = lv_label_create(settings_panel);
-    lv_label_set_text(settings_title, "Display Settings");
+    lv_label_set_text(settings_title, "Settings");
     lv_obj_set_style_text_color(settings_title, lv_color_hex(0xF7FAFF), 0);
     lv_obj_set_style_text_font(settings_title, &lv_font_montserrat_20, 0);
     lv_obj_align(settings_title, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -399,6 +426,23 @@ static void desktop_create_ui(void)
     lv_slider_set_value(brightness_slider, desktop_brightness, LV_ANIM_OFF);
     lv_obj_add_event_cb(brightness_slider, desktop_brightness_slider_event, LV_EVENT_VALUE_CHANGED, NULL);
 
+    lv_obj_t *wifi_title = lv_label_create(settings_panel);
+    lv_label_set_text(wifi_title, "Wi-Fi");
+    lv_obj_set_style_text_color(wifi_title, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_align(wifi_title, LV_ALIGN_TOP_LEFT, 0, 150);
+
+    lv_obj_t *wifi_button = lv_btn_create(settings_panel);
+    lv_obj_set_size(wifi_button, lv_pct(100), 48);
+    lv_obj_align(wifi_button, LV_ALIGN_TOP_MID, 0, 182);
+    lv_obj_set_style_radius(wifi_button, 16, 0);
+    lv_obj_set_style_bg_color(wifi_button, lv_color_hex(0x2C487A), 0);
+    lv_obj_add_event_cb(wifi_button, desktop_wifi_setup_event, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *wifi_button_label = lv_label_create(wifi_button);
+    lv_label_set_text(wifi_button_label, LV_SYMBOL_WIFI " Re-provision Wi-Fi");
+    lv_obj_set_style_text_color(wifi_button_label, lv_color_hex(0xF7FAFF), 0);
+    lv_obj_center(wifi_button_label);
+
     lv_screen_load(screen);
     desktop_set_brightness(desktop_brightness);
     desktop_refresh(NULL);
@@ -416,6 +460,11 @@ void DesktopUI_Init(I2cMasterBus *i2c_bus, DisplayPort *display)
 
 void DesktopUI_ShowProvisioningQR(const char *service_name, const char *service_key, const char *qr_payload)
 {
+    if(prov_screen != NULL) {
+        lv_obj_delete(prov_screen);
+        prov_screen = NULL;
+    }
+
     prov_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(prov_screen, lv_color_hex(0x0B1020), 0);
     lv_obj_set_style_pad_all(prov_screen, 16, 0);
