@@ -4,6 +4,7 @@ idf_component_register(
     "display_bsp.cpp"
     PRIV_REQUIRES 
     driver
+    esp_driver_i2c
     esp_lcd
     esp_lcd_sh8601
     esp_lcd_touch_cst9217

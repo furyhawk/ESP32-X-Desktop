@@ -3,6 +3,7 @@ idf_component_register(
     "i2c_bsp.cpp" 
     PRIV_REQUIRES 
     driver
+    esp_driver_i2c
     pmicpower
     esp_timer 
     INCLUDE_DIRS 

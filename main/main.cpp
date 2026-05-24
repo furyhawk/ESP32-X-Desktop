@@ -16,6 +16,8 @@ I2cMasterBus user_i2cbus(7,8,0); //scl,sda,i2c_port
 DisplayPort *user_display = NULL;
 static qmi8658_dev_t qmi8658;
 static uint8_t current_rotation = 0;
+static constexpr uint32_t QMI8658_TASK_STACK_SIZE = 6 * 1024;
+static constexpr UBaseType_t QMI8658_STACK_WARN_WORDS = 256;
 
 static bool qmi8658_detect_rotation(const qmi8658_data_t *sensor_data, uint8_t *new_rotation)
 {
@@ -45,6 +47,7 @@ static void qmi8658_orientation_task(void *arg)
     uint8_t pending_rotation = current_rotation;
     int stable_samples = 0;
     const int samples_required = 3;
+    uint32_t loop_count = 0;
 
     while(1) {
         bool ready = false;
@@ -64,7 +67,13 @@ static void qmi8658_orientation_task(void *arg)
 
                     if(stable_samples >= samples_required && user_display != NULL) {
                         current_rotation = detected_rotation;
-                        user_display->Set_Rotate(current_rotation);
+                        if(Lvgl_lock(200) == ESP_OK) {
+                            user_display->Set_Rotate(current_rotation);
+                            Lvgl_HandleRotationChange();
+                            Lvgl_unlock();
+                        } else {
+                            user_display->Set_Rotate(current_rotation);
+                        }
                         ESP_LOGI(TAG, "Screen rotation changed to %s", current_rotation ? "landscape" : "portrait");
                         stable_samples = 0;
                     }
@@ -72,6 +81,14 @@ static void qmi8658_orientation_task(void *arg)
                     stable_samples = 0;
                     pending_rotation = current_rotation;
                 }
+            }
+        }
+
+        loop_count++;
+        if((loop_count % 100) == 0) {
+            UBaseType_t free_words = uxTaskGetStackHighWaterMark(NULL);
+            if(free_words < QMI8658_STACK_WARN_WORDS) {
+                ESP_LOGW(TAG, "qmi8658 task low stack watermark: %u words", (unsigned)free_words);
             }
         }
 
@@ -106,7 +123,7 @@ extern "C" void app_main(void)
         qmi8658_set_accel_unit_mps2(&qmi8658, true);
         qmi8658_set_gyro_unit_rads(&qmi8658, true);
         qmi8658_set_display_precision(&qmi8658, 4);
-        xTaskCreatePinnedToCore(qmi8658_orientation_task, "qmi8658_orientation", 3 * 1024, NULL, 3, NULL, 0);
+        xTaskCreatePinnedToCore(qmi8658_orientation_task, "qmi8658_orientation", QMI8658_TASK_STACK_SIZE, NULL, 2, NULL, 0);
     }
 
     if(WifiProvisioning_IsProvisioning()) {

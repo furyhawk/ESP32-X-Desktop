@@ -126,3 +126,21 @@ esp_err_t Lvgl_PortInit(DisplayPort &display) {
 void Lvgl_Refresh(void) {
     esp_lv_adapter_refresh_now(disp);
 }
+
+void Lvgl_HandleRotationChange(void)
+{
+    if(disp == NULL) {
+        return;
+    }
+
+#if LVGL_VERSION_MAJOR >= 9
+    lv_obj_t *screen = lv_screen_active();
+#else
+    lv_obj_t *screen = lv_scr_act();
+#endif
+    if(screen != NULL) {
+        // Force a full redraw after MADCTL rotation since only dirty regions are usually refreshed.
+        lv_obj_invalidate(screen);
+    }
+    esp_lv_adapter_refresh_now(disp);
+}

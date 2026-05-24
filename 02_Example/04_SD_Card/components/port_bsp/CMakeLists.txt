@@ -4,6 +4,7 @@ idf_component_register(
     "sdcard_bsp.cpp" 
     PRIV_REQUIRES 
     driver
+    esp_driver_i2c
     pmicpower
     REQUIRES
     esp_driver_sdmmc
