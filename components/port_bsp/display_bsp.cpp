@@ -100,7 +100,7 @@ void DisplayPort::DisplayPort_TouchInit(void) {
     tp_cfg.flags.mirror_y = 1;
     tp_cfg.process_coordinates = NULL;
     tp_cfg.interrupt_callback = NULL;
-    tp_cfg.user_data = NULL;
+    tp_cfg.user_data = this;
     tp_cfg.driver_data = NULL;
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = {};
@@ -131,16 +131,44 @@ void DisplayPort::Set_Backlight(uint8_t brightness) {
 }
 
 void DisplayPort::Set_Rotate(uint8_t Rotate) {
+    current_rotation_ = Rotate & 0x01;
     uint8_t rot = 0x00;
     uint32_t CMD = 0x36;
     CMD &= 0xFF;
     CMD <<= 8;
     CMD |= 0x02 << 24;
-    if(Rotate == 1) {
+    if(current_rotation_ == 1) {
         rot = 0x30;
     }
     else {
         rot = 0x00;
     }
     esp_lcd_panel_io_tx_param(io_handle, CMD, &rot,1);
+
+    if(ret_touch != NULL) {
+        bool touch_mirror_x = false;
+        bool touch_mirror_y = true;
+        uint8_t touch_rotation = (current_rotation_ + touch_rotation_offset_) & 0x01;
+        if(touch_rotation == 1) {
+            touch_mirror_x = false;
+            touch_mirror_y = false;
+            ESP_ERROR_CHECK(esp_lcd_touch_set_swap_xy(ret_touch, false));
+        }
+        else {
+            touch_mirror_x = false;
+            touch_mirror_y = true;
+            ESP_ERROR_CHECK(esp_lcd_touch_set_swap_xy(ret_touch, true));
+        }
+
+        ESP_ERROR_CHECK(esp_lcd_touch_set_mirror_x(ret_touch, touch_mirror_x));
+        ESP_ERROR_CHECK(esp_lcd_touch_set_mirror_y(ret_touch, touch_mirror_y));
+    }
+}
+
+void DisplayPort::Set_TouchRotationOffset(uint8_t offset) {
+    touch_rotation_offset_ = offset & 0x01;
+
+    if(ret_touch != NULL) {
+        Set_Rotate(current_rotation_);
+    }
 }

@@ -101,6 +101,7 @@ extern "C" void app_main(void)
     Custom_PmicPortInit(&user_i2cbus,0x34);
 
     user_display = new DisplayPort(user_i2cbus,480,480);
+    user_display->Set_TouchRotationOffset(SENSOR_ROTATION_OFFSET);
     user_display->DisplayPort_TouchInit();
     user_display->Set_Rotate(current_rotation);
     ESP_ERROR_CHECK(Lvgl_PortInit(*user_display));
