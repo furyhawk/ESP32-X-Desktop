@@ -18,6 +18,7 @@ static qmi8658_dev_t qmi8658;
 static uint8_t current_rotation = 0;
 static constexpr uint32_t QMI8658_TASK_STACK_SIZE = 6 * 1024;
 static constexpr UBaseType_t QMI8658_STACK_WARN_WORDS = 256;
+static constexpr uint8_t SENSOR_ROTATION_OFFSET = 1; // +90 degrees clockwise (mod 2 for 0/90 states)
 
 static bool qmi8658_detect_rotation(const qmi8658_data_t *sensor_data, uint8_t *new_rotation)
 {
@@ -28,12 +29,12 @@ static bool qmi8658_detect_rotation(const qmi8658_data_t *sensor_data, uint8_t *
     float abs_y = (sensor_data->accelY < 0.0f) ? -sensor_data->accelY : sensor_data->accelY;
 
     if(abs_x > min_tilt_mps2 && abs_x > (abs_y + axis_margin_mps2)) {
-        *new_rotation = 1;
+        *new_rotation = (1 + SENSOR_ROTATION_OFFSET) & 0x01;
         return true;
     }
 
     if(abs_y > min_tilt_mps2 && abs_y > (abs_x + axis_margin_mps2)) {
-        *new_rotation = 0;
+        *new_rotation = (0 + SENSOR_ROTATION_OFFSET) & 0x01;
         return true;
     }
 
