@@ -24,7 +24,6 @@ private:
     bool is_touchinitialized_ = false;
     uint8_t brightness_ = 100;
     uint8_t current_rotation_ = 0;
-    uint8_t touch_rotation_offset_ = 0;
 
     int DisplayPort_DispReset(void);
 public:
@@ -34,7 +33,6 @@ public:
     void DisplayPort_TouchInit(void);
     void Set_Backlight(uint8_t brightness);
     void Set_Rotate(uint8_t Rotate);
-    void Set_TouchRotationOffset(uint8_t offset);
 
     spi_host_device_t Get_SpiHost() { return spihost_; }
     esp_lcd_panel_handle_t Get_PanelHandle() { return panel_handle; }

@@ -147,28 +147,16 @@ void DisplayPort::Set_Rotate(uint8_t Rotate) {
 
     if(ret_touch != NULL) {
         bool touch_mirror_x = false;
-        bool touch_mirror_y = true;
-        uint8_t touch_rotation = (current_rotation_ + touch_rotation_offset_) & 0x01;
-        if(touch_rotation == 1) {
-            touch_mirror_x = false;
-            touch_mirror_y = false;
-            ESP_ERROR_CHECK(esp_lcd_touch_set_swap_xy(ret_touch, false));
-        }
-        else {
+        bool touch_mirror_y = false;
+        bool touch_swap_xy = false;
+        if(current_rotation_ == 1) {
             touch_mirror_x = false;
             touch_mirror_y = true;
-            ESP_ERROR_CHECK(esp_lcd_touch_set_swap_xy(ret_touch, true));
+            touch_swap_xy = true;
         }
 
+        ESP_ERROR_CHECK(esp_lcd_touch_set_swap_xy(ret_touch, touch_swap_xy));
         ESP_ERROR_CHECK(esp_lcd_touch_set_mirror_x(ret_touch, touch_mirror_x));
         ESP_ERROR_CHECK(esp_lcd_touch_set_mirror_y(ret_touch, touch_mirror_y));
-    }
-}
-
-void DisplayPort::Set_TouchRotationOffset(uint8_t offset) {
-    touch_rotation_offset_ = offset & 0x01;
-
-    if(ret_touch != NULL) {
-        Set_Rotate(current_rotation_);
     }
 }
