@@ -9,4 +9,4 @@ endif()
 # Work around managed-component warnings that are promoted by global -Werror.
 add_compile_options(-Wno-error=attributes -Wno-error=cpp -Wno-error=missing-field-initializers)
 
-project(09_LVGL_V9_Test)
+project(LVGL_ESP32_DESKTOP_UI)
