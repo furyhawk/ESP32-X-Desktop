@@ -1,0 +1,29 @@
+menu "Hardware Platform"
+
+    choice HW_PLATFORM
+        prompt "Select target hardware platform"
+        default HW_PLATFORM_ESP32C6_AMOLED_480X480
+        help
+            Choose the hardware platform profile to compile for.
+            Each profile defines GPIO pin assignments, display resolution,
+            controller types, and available peripherals.
+
+        config HW_PLATFORM_ESP32C6_AMOLED_480X480
+            bool "ESP32-C6 AMOLED 2.16\" — SH8601, CST9217 touch, 480×480"
+            help
+                Waveshare ESP32-C6-Touch-AMOLED-2.16 board.
+                Display: SH8601 (QSPI), 480×480, 16-bit colour.
+                Touch: CST9217 (I2C).
+                PMIC: AXP2101.
+                IMU: QMI8658.
+
+        config HW_PLATFORM_DUMMY_BOARD
+            bool "Dummy / template board (all pins NC)"
+            help
+                Blank template profile for bring-up of a new board.
+                All GPIO pins are set to NC — fill in profiles/dummy_board.h
+                before using this profile in production.
+
+    endchoice
+
+endmenu

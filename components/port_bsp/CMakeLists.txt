@@ -2,6 +2,8 @@ idf_component_register(
     SRCS 
     "i2c_bsp.cpp" 
     "display_bsp.cpp" 
+    REQUIRES
+    hw_platform
     PRIV_REQUIRES 
     driver
     esp_driver_i2c
