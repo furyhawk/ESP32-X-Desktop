@@ -359,11 +359,12 @@ static void desktop_create_ui(void)
     desktop_widgets.time_label = lv_label_create(hero_card);
     lv_label_set_text(desktop_widgets.time_label, "--:--:--");
     lv_obj_set_style_text_color(desktop_widgets.time_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(desktop_widgets.time_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(desktop_widgets.time_label, &lv_font_montserrat_26, 0);
 
     desktop_widgets.date_label = lv_label_create(hero_card);
     lv_label_set_text(desktop_widgets.date_label, "Waiting for RTC");
     lv_obj_set_style_text_color(desktop_widgets.date_label, lv_color_hex(0xB8CAE6), 0);
+    lv_obj_set_style_text_font(desktop_widgets.date_label, &lv_font_montserrat_20, 0);
 
     desktop_widgets.status_label = lv_label_create(screen);
     lv_label_set_text(desktop_widgets.status_label, "Initializing");

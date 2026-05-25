@@ -1,11 +1,9 @@
 # Repository Instructions
 
 ## Scope
-This repository targets Waveshare's ESP32-C6-Touch-AMOLED-2.16 board. Keep changes aligned with the current split between the main app, reusable board support components, and the self-contained examples under [02_Example/](02_Example/).
+This repository targets Waveshare's ESP32-C6-Touch-AMOLED-2.16 board. Keep changes aligned with the current split between the main app, reusable board support components.
 
 ## Build And Validate
-- Prefer `cmake --build build -j4` from the repo root for validation.
-- Treat `idf.py build` as unreliable in this environment unless the Python/ESP-IDF setup has been fixed.
 - When changing the active app, validate with a full rebuild rather than editing build outputs.
 
 ## Project Layout
