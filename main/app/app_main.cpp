@@ -8,6 +8,7 @@
 #include "desktop_ui.h"
 #include "wifi_provisioning.h"
 #include "qmi8658.h"
+#include "audio_bsp.h"
 
 #define TAG "main"
 
@@ -109,6 +110,8 @@ extern "C" void app_main(void)
         DesktopUI_Init(&user_i2cbus, user_display);
         Lvgl_unlock();
     }
+
+    (void)BoardAudio_PlayWelcomeSound();
 
     ESP_ERROR_CHECK(WifiProvisioning_Bootstrap());
 

@@ -1,0 +1,11 @@
+idf_component_register(
+    SRCS
+    "audio_bsp.cpp"
+    REQUIRES
+    hw_platform
+    codec_board
+    espressif__esp_codec_dev
+    PRIV_REQUIRES
+    freertos
+    INCLUDE_DIRS
+    "./")

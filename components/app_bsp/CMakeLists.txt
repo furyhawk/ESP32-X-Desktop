@@ -5,6 +5,7 @@ idf_component_register(
     espressif__esp_lvgl_adapter
     port_bsp
     lvgl__lvgl
+    esp_timer
     main
     INCLUDE_DIRS 
     "./")
