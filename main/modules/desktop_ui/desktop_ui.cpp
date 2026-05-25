@@ -218,6 +218,7 @@ static esp_err_t desktop_fetch_temperature_history(void)
         esp_http_client_config_t config = {};
         config.url = TEMP_SEARCH_URL;
         config.method = HTTP_METHOD_GET;
+        config.transport_type = is_https ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP;
         config.timeout_ms = TEMP_HTTP_TIMEOUT_MS;
         config.event_handler = desktop_http_event_cb;
         config.user_data = &response;
