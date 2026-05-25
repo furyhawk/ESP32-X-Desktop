@@ -368,6 +368,18 @@ bool WifiProvisioning_IsProvisioning(void)
     return wifi_is_provisioning;
 }
 
+bool WifiProvisioning_IsConnected(void)
+{
+    return wifi_is_connected && !wifi_is_provisioning;
+}
+
+bool WifiProvisioning_IsSystemTimeSynchronized(void)
+{
+    const time_t minimum_valid_epoch = 1704067200; /* 2024-01-01 00:00:00 UTC */
+    time_t now = time(NULL);
+    return now >= minimum_valid_epoch;
+}
+
 void WifiProvisioning_GetConnectionStatus(char *buf, size_t len)
 {
     if(buf == NULL || len == 0) {

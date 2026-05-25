@@ -10,6 +10,8 @@ idf_component_register(
          esp_http_client
          espressif__cjson
          mbedtls
+    EMBED_TXTFILES
+         "certs/temp_api_ca_chain.pem"
     INCLUDE_DIRS "."
                  "app"
                  "modules/desktop_ui"

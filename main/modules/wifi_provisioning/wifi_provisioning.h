@@ -12,6 +12,12 @@ esp_err_t WifiProvisioning_Reprovision(void);
 /** Returns true if SoftAP provisioning is currently active (device not yet provisioned). */
 bool WifiProvisioning_IsProvisioning(void);
 
+/** Returns true when STA is connected and provisioning is not active. */
+bool WifiProvisioning_IsConnected(void);
+
+/** Returns true if the system clock appears to be valid for TLS certificate checks. */
+bool WifiProvisioning_IsSystemTimeSynchronized(void);
+
 /** Writes a short Wi-Fi connection status string for UI display. */
 void WifiProvisioning_GetConnectionStatus(char *buf, size_t len);
 

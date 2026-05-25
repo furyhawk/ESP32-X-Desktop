@@ -50,7 +50,8 @@ static lv_obj_t *prov_screen   = NULL;
 static constexpr uint32_t TEMP_FETCH_INTERVAL_MS = 30000;
 static constexpr uint32_t TEMP_HTTP_TIMEOUT_MS = 8000;
 static constexpr size_t TEMP_HISTORY_POINTS = 24;
-static const char *TEMP_SEARCH_URL = "https://api.furyhawk.lol/temperature/search?limit=24";
+static const char *TEMP_SEARCH_URL = "http://wttr.in/?format=%t";
+extern const uint8_t temp_api_ca_chain_pem_start[] asm("_binary_temp_api_ca_chain_pem_start");
 
 typedef struct {
     char *buffer;
@@ -152,42 +153,127 @@ static void desktop_store_temperature_history(const float *history, size_t histo
     xSemaphoreGive(temp_data_mutex);
 }
 
+static bool desktop_parse_numeric_text(const char *text, float *value)
+{
+    if(text == NULL || value == NULL) {
+        return false;
+    }
+
+    const char *start = text;
+    while(*start != '\0') {
+        if((*start >= '0' && *start <= '9') || *start == '-' || *start == '+') {
+            break;
+        }
+        ++start;
+    }
+
+    if(*start == '\0') {
+        return false;
+    }
+
+    char *end_ptr = NULL;
+    double parsed = strtod(start, &end_ptr);
+    if(end_ptr == start) {
+        return false;
+    }
+
+    *value = (float)parsed;
+    return true;
+}
+
+static void desktop_append_temperature_sample(float sample_c)
+{
+    if(temp_data_mutex == NULL) {
+        return;
+    }
+
+    if(xSemaphoreTake(temp_data_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return;
+    }
+
+    if(temp_history_count >= TEMP_HISTORY_POINTS) {
+        memmove(temp_history_c,
+                temp_history_c + 1,
+                (TEMP_HISTORY_POINTS - 1) * sizeof(float));
+        temp_history_count = TEMP_HISTORY_POINTS - 1;
+    }
+
+    temp_history_c[temp_history_count++] = sample_c;
+    temp_latest_c = sample_c;
+    temp_data_valid = true;
+    xSemaphoreGive(temp_data_mutex);
+}
+
 static esp_err_t desktop_fetch_temperature_history(void)
 {
     http_buffer_t response = {};
-    esp_http_client_config_t config = {};
-    config.url = TEMP_SEARCH_URL;
-    config.method = HTTP_METHOD_GET;
-    config.timeout_ms = TEMP_HTTP_TIMEOUT_MS;
-    config.event_handler = desktop_http_event_cb;
-    config.user_data = &response;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
+    esp_err_t ret = ESP_FAIL;
+    bool is_https = (strncmp(TEMP_SEARCH_URL, "https://", 8) == 0);
+    int max_attempts = is_https ? 2 : 3;
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if(client == NULL) {
-        ESP_LOGW(TAG, "Temperature HTTP client init failed");
-        return ESP_FAIL;
-    }
+    for(int attempt = 0; attempt < max_attempts; ++attempt) {
+        bool use_bundle_fallback = (attempt == 1);
+        response = {};
 
-    esp_err_t ret = esp_http_client_perform(client);
-    if(ret != ESP_OK) {
-        ESP_LOGW(TAG, "Temperature request failed: %d", ret);
+        esp_http_client_config_t config = {};
+        config.url = TEMP_SEARCH_URL;
+        config.method = HTTP_METHOD_GET;
+        config.timeout_ms = TEMP_HTTP_TIMEOUT_MS;
+        config.event_handler = desktop_http_event_cb;
+        config.user_data = &response;
+        if(is_https) {
+            config.common_name = "api.furyhawk.lol";
+            config.tls_version = ESP_HTTP_CLIENT_TLS_VER_TLS_1_2;
+            if(use_bundle_fallback) {
+                config.crt_bundle_attach = esp_crt_bundle_attach;
+            } else {
+                config.cert_pem = (const char *)temp_api_ca_chain_pem_start;
+            }
+        }
+
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if(client == NULL) {
+            ESP_LOGW(TAG, "Temperature HTTP client init failed");
+            return ESP_FAIL;
+        }
+
+        ret = esp_http_client_perform(client);
+        if(ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Temperature request failed (%s): %s (%d)",
+                     is_https ? (use_bundle_fallback ? "bundle" : "embedded-ca") : "http",
+                     esp_err_to_name(ret),
+                     ret);
+            esp_http_client_cleanup(client);
+            free(response.buffer);
+            response.buffer = NULL;
+            if(is_https && !use_bundle_fallback) {
+                continue;
+            }
+            return ret;
+        }
+
+        int status = esp_http_client_get_status_code(client);
         esp_http_client_cleanup(client);
-        free(response.buffer);
-        return ret;
+        if(status != 200) {
+            ESP_LOGW(TAG, "Temperature request returned HTTP %d", status);
+            free(response.buffer);
+            return ESP_FAIL;
+        }
+
+        break;
     }
 
-    int status = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-    if(status != 200) {
-        ESP_LOGW(TAG, "Temperature request returned HTTP %d", status);
+    float plain_text_temp_c = 0.0f;
+    if(desktop_parse_numeric_text(response.buffer, &plain_text_temp_c)) {
+        desktop_append_temperature_sample(plain_text_temp_c);
         free(response.buffer);
-        return ESP_FAIL;
+        return ESP_OK;
     }
 
     cJSON *root = cJSON_Parse(response.buffer);
     free(response.buffer);
-    if(root == NULL || !cJSON_IsArray(root)) {
+    if(root == NULL) {
         cJSON_Delete(root);
         ESP_LOGW(TAG, "Temperature response parsing failed");
         return ESP_FAIL;
@@ -195,20 +281,75 @@ static esp_err_t desktop_fetch_temperature_history(void)
 
     float local_history[TEMP_HISTORY_POINTS] = {};
     size_t local_count = 0;
-    int total = cJSON_GetArraySize(root);
-    int start = total - (int)TEMP_HISTORY_POINTS;
-    if(start < 0) {
-        start = 0;
+
+    if(cJSON_IsArray(root)) {
+        int total = cJSON_GetArraySize(root);
+        int start = total - (int)TEMP_HISTORY_POINTS;
+        if(start < 0) {
+            start = 0;
+        }
+
+        for(int i = start; i < total && local_count < TEMP_HISTORY_POINTS; ++i) {
+            cJSON *entry = cJSON_GetArrayItem(root, i);
+            cJSON *temp_item = cJSON_GetObjectItemCaseSensitive(entry, "temperature");
+            bool ok = false;
+            float value_c = desktop_parse_temperature_value(temp_item, &ok);
+            if(ok) {
+                local_history[local_count++] = value_c;
+            }
+        }
+    } else if(cJSON_IsObject(root)) {
+        cJSON *weather = cJSON_GetObjectItemCaseSensitive(root, "weather");
+        if(cJSON_IsArray(weather)) {
+            int day_count = cJSON_GetArraySize(weather);
+            for(int d = 0; d < day_count; ++d) {
+                cJSON *day_item = cJSON_GetArrayItem(weather, d);
+                cJSON *hourly = cJSON_GetObjectItemCaseSensitive(day_item, "hourly");
+                if(!cJSON_IsArray(hourly)) {
+                    continue;
+                }
+
+                int hourly_count = cJSON_GetArraySize(hourly);
+                for(int h = 0; h < hourly_count && local_count < TEMP_HISTORY_POINTS; ++h) {
+                    cJSON *hourly_item = cJSON_GetArrayItem(hourly, h);
+                    cJSON *temp_item = cJSON_GetObjectItemCaseSensitive(hourly_item, "tempC");
+                    bool ok = false;
+                    float value_c = desktop_parse_temperature_value(temp_item, &ok);
+                    if(ok) {
+                        local_history[local_count++] = value_c;
+                    }
+                }
+
+                if(local_count >= TEMP_HISTORY_POINTS) {
+                    break;
+                }
+            }
+        }
+
+        if(local_count == 0) {
+            cJSON *current = cJSON_GetObjectItemCaseSensitive(root, "current_condition");
+            if(cJSON_IsArray(current) && cJSON_GetArraySize(current) > 0) {
+                cJSON *first = cJSON_GetArrayItem(current, 0);
+                cJSON *temp_item = cJSON_GetObjectItemCaseSensitive(first, "temp_C");
+                bool ok = false;
+                float value_c = desktop_parse_temperature_value(temp_item, &ok);
+                if(ok) {
+                    local_history[local_count++] = value_c;
+                }
+            }
+        }
     }
 
-    for(int i = start; i < total && local_count < TEMP_HISTORY_POINTS; ++i) {
-        cJSON *entry = cJSON_GetArrayItem(root, i);
-        cJSON *temp_item = cJSON_GetObjectItemCaseSensitive(entry, "temperature");
-        bool ok = false;
-        float value_c = desktop_parse_temperature_value(temp_item, &ok);
-        if(ok) {
-            local_history[local_count++] = value_c;
-        }
+    if(local_count > TEMP_HISTORY_POINTS) {
+        size_t keep = TEMP_HISTORY_POINTS;
+        memmove(local_history, local_history + (local_count - keep), keep * sizeof(float));
+        local_count = keep;
+    }
+
+    if(local_count == 0) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Temperature response parsing failed");
+        return ESP_FAIL;
     }
 
     cJSON_Delete(root);
@@ -221,7 +362,9 @@ static void desktop_temperature_task(void *arg)
     LV_UNUSED(arg);
 
     while(1) {
-        if(!WifiProvisioning_IsProvisioning()) {
+        if(!WifiProvisioning_IsProvisioning() &&
+           WifiProvisioning_IsConnected() &&
+           WifiProvisioning_IsSystemTimeSynchronized()) {
             (void)desktop_fetch_temperature_history();
         }
         vTaskDelay(pdMS_TO_TICKS(TEMP_FETCH_INTERVAL_MS));
