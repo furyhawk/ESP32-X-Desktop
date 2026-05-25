@@ -34,14 +34,12 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/esp_codec_dev:
-    component_hash: 3a1df01ee46d64c55155341bb6f4834db33db7dbd9b637e476e1eab64d01295a
     dependencies:
     - name: idf
-      require: private
       version: '>=4.0'
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: components/esp_codec_dev
+      type: local
     version: 1.4.0
   espressif/esp_lcd_sh8601:
     component_hash: 9597cce74af4bae0ec423ee819a2916b995ff3e5bb8d590bdb0a27fa9e715dab
@@ -311,6 +309,6 @@ direct_dependencies:
 - waveshare/esp_lcd_touch_cst9217
 - waveshare/pcf85063a
 - waveshare/qmi8658
-manifest_hash: f4b0c1c694d3b31623b46182f2333db8f19aa8982ef96218ec14d864550e5cfa
+manifest_hash: 674b865190c20edea7d5cd705b9cf52cb0fdc7084c5249c466fb87ad5be9409e
 target: esp32c6
 version: 3.0.0
