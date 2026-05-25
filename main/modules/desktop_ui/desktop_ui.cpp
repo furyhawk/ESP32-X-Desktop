@@ -758,7 +758,7 @@ static void desktop_create_ui(void)
     lv_obj_set_flex_align(top_bar, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
     lv_obj_t *title_label = lv_label_create(top_bar);
-    lv_label_set_text(title_label, "ESP32-C6 Desktop");
+    lv_label_set_text(title_label, "ESP32-X Desktop");
     lv_obj_set_style_text_color(title_label, lv_color_hex(0xF4F7FB), 0);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_20, 0);
 
