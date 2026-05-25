@@ -7,6 +7,9 @@
 
 void DesktopUI_Init(I2cMasterBus *i2c_bus, DisplayPort *display);
 
+/** Starts background network telemetry tasks after network stack bootstrap. */
+void DesktopUI_StartTelemetry(void);
+
 /** Seeds the system clock from the RTC if available. */
 esp_err_t DesktopUI_SyncSystemTimeFromRtc(void);
 

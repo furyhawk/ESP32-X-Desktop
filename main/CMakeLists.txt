@@ -7,6 +7,9 @@ idf_component_register(
          app_bsp
          pmicpower
          nvs_flash
+         esp_http_client
+         espressif__cjson
+         mbedtls
     INCLUDE_DIRS "."
                  "app"
                  "modules/desktop_ui"

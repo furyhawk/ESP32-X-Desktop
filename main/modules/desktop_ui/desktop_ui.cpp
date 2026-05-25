@@ -1,13 +1,21 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_http_client.h>
+#include <esp_crt_bundle.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 #include "lvgl.h"
 #include "pcf85063a.h"
+#include "cJSON.h"
 
 #include "power_bsp.h"
 #include "desktop_ui.h"
@@ -21,6 +29,9 @@ typedef struct {
     lv_obj_t *date_label;
     lv_obj_t *battery_label;
     lv_obj_t *status_label;
+    lv_obj_t *temperature_label;
+    lv_obj_t *temperature_chart;
+    lv_chart_series_t *temperature_series;
 } desktop_widgets_t;
 
 static desktop_widgets_t desktop_widgets = {};
@@ -35,6 +46,271 @@ static lv_obj_t *settings_panel = NULL;
 static lv_obj_t *brightness_value_label = NULL;
 static lv_obj_t *desktop_screen = NULL;
 static lv_obj_t *prov_screen   = NULL;
+
+static constexpr uint32_t TEMP_FETCH_INTERVAL_MS = 30000;
+static constexpr uint32_t TEMP_HTTP_TIMEOUT_MS = 8000;
+static constexpr size_t TEMP_HISTORY_POINTS = 24;
+static const char *TEMP_SEARCH_URL = "https://api.furyhawk.lol/temperature/search?limit=24";
+
+typedef struct {
+    char *buffer;
+    size_t size;
+    size_t capacity;
+} http_buffer_t;
+
+static SemaphoreHandle_t temp_data_mutex = NULL;
+static bool temp_data_valid = false;
+static float temp_latest_c = 0.0f;
+static float temp_history_c[TEMP_HISTORY_POINTS] = {};
+static size_t temp_history_count = 0;
+static bool temp_task_started = false;
+
+static float desktop_parse_temperature_value(const cJSON *temp_item, bool *ok)
+{
+    *ok = false;
+    if(temp_item == NULL) {
+        return 0.0f;
+    }
+
+    if(cJSON_IsNumber(temp_item)) {
+        *ok = true;
+        return (float)temp_item->valuedouble;
+    }
+
+    if(cJSON_IsString(temp_item) && temp_item->valuestring != NULL) {
+        char *end_ptr = NULL;
+        double parsed = strtod(temp_item->valuestring, &end_ptr);
+        if(end_ptr != temp_item->valuestring) {
+            *ok = true;
+            return (float)parsed;
+        }
+    }
+
+    return 0.0f;
+}
+
+static esp_err_t desktop_http_event_cb(esp_http_client_event_t *evt)
+{
+    if(evt == NULL || evt->user_data == NULL) {
+        return ESP_OK;
+    }
+
+    http_buffer_t *response = (http_buffer_t *)evt->user_data;
+    if(evt->event_id != HTTP_EVENT_ON_DATA || evt->data == NULL || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+
+    size_t needed = response->size + (size_t)evt->data_len + 1;
+    if(needed > response->capacity) {
+        size_t new_capacity = (response->capacity == 0) ? 1024 : response->capacity;
+        while(new_capacity < needed) {
+            new_capacity *= 2;
+        }
+
+        char *new_buffer = (char *)realloc(response->buffer, new_capacity);
+        if(new_buffer == NULL) {
+            return ESP_FAIL;
+        }
+
+        response->buffer = new_buffer;
+        response->capacity = new_capacity;
+    }
+
+    memcpy(response->buffer + response->size, evt->data, (size_t)evt->data_len);
+    response->size += (size_t)evt->data_len;
+    response->buffer[response->size] = '\0';
+    return ESP_OK;
+}
+
+static void desktop_store_temperature_history(const float *history, size_t history_count)
+{
+    if(temp_data_mutex == NULL) {
+        return;
+    }
+
+    if(xSemaphoreTake(temp_data_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return;
+    }
+
+    size_t count = history_count;
+    if(count > TEMP_HISTORY_POINTS) {
+        count = TEMP_HISTORY_POINTS;
+    }
+
+    memset(temp_history_c, 0, sizeof(temp_history_c));
+    if(count > 0) {
+        memcpy(temp_history_c, history, count * sizeof(float));
+        temp_latest_c = history[count - 1];
+        temp_history_count = count;
+        temp_data_valid = true;
+    } else {
+        temp_latest_c = 0.0f;
+        temp_history_count = 0;
+        temp_data_valid = false;
+    }
+
+    xSemaphoreGive(temp_data_mutex);
+}
+
+static esp_err_t desktop_fetch_temperature_history(void)
+{
+    http_buffer_t response = {};
+    esp_http_client_config_t config = {};
+    config.url = TEMP_SEARCH_URL;
+    config.method = HTTP_METHOD_GET;
+    config.timeout_ms = TEMP_HTTP_TIMEOUT_MS;
+    config.event_handler = desktop_http_event_cb;
+    config.user_data = &response;
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if(client == NULL) {
+        ESP_LOGW(TAG, "Temperature HTTP client init failed");
+        return ESP_FAIL;
+    }
+
+    esp_err_t ret = esp_http_client_perform(client);
+    if(ret != ESP_OK) {
+        ESP_LOGW(TAG, "Temperature request failed: %d", ret);
+        esp_http_client_cleanup(client);
+        free(response.buffer);
+        return ret;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if(status != 200) {
+        ESP_LOGW(TAG, "Temperature request returned HTTP %d", status);
+        free(response.buffer);
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(response.buffer);
+    free(response.buffer);
+    if(root == NULL || !cJSON_IsArray(root)) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Temperature response parsing failed");
+        return ESP_FAIL;
+    }
+
+    float local_history[TEMP_HISTORY_POINTS] = {};
+    size_t local_count = 0;
+    int total = cJSON_GetArraySize(root);
+    int start = total - (int)TEMP_HISTORY_POINTS;
+    if(start < 0) {
+        start = 0;
+    }
+
+    for(int i = start; i < total && local_count < TEMP_HISTORY_POINTS; ++i) {
+        cJSON *entry = cJSON_GetArrayItem(root, i);
+        cJSON *temp_item = cJSON_GetObjectItemCaseSensitive(entry, "temperature");
+        bool ok = false;
+        float value_c = desktop_parse_temperature_value(temp_item, &ok);
+        if(ok) {
+            local_history[local_count++] = value_c;
+        }
+    }
+
+    cJSON_Delete(root);
+    desktop_store_temperature_history(local_history, local_count);
+    return (local_count > 0) ? ESP_OK : ESP_FAIL;
+}
+
+static void desktop_temperature_task(void *arg)
+{
+    LV_UNUSED(arg);
+
+    while(1) {
+        (void)desktop_fetch_temperature_history();
+        vTaskDelay(pdMS_TO_TICKS(TEMP_FETCH_INTERVAL_MS));
+    }
+}
+
+static void desktop_update_temperature_widgets(void)
+{
+    float local_history[TEMP_HISTORY_POINTS] = {};
+    size_t local_count = 0;
+    float local_latest = 0.0f;
+    bool local_valid = false;
+
+    if(temp_data_mutex != NULL && xSemaphoreTake(temp_data_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        local_count = temp_history_count;
+        if(local_count > TEMP_HISTORY_POINTS) {
+            local_count = TEMP_HISTORY_POINTS;
+        }
+
+        if(local_count > 0) {
+            memcpy(local_history, temp_history_c, local_count * sizeof(float));
+        }
+
+        local_latest = temp_latest_c;
+        local_valid = temp_data_valid;
+        xSemaphoreGive(temp_data_mutex);
+    }
+
+    if(desktop_widgets.temperature_label != NULL) {
+        char temp_text[40] = {0};
+        if(local_valid && local_count > 0) {
+            snprintf(temp_text, sizeof(temp_text), "Temperature: %.1f C", local_latest);
+        } else {
+            snprintf(temp_text, sizeof(temp_text), "Temperature: --.- C");
+        }
+        lv_label_set_text(desktop_widgets.temperature_label, temp_text);
+    }
+
+    if(desktop_widgets.temperature_chart == NULL || desktop_widgets.temperature_series == NULL) {
+        return;
+    }
+
+    lv_chart_set_point_count(desktop_widgets.temperature_chart, TEMP_HISTORY_POINTS);
+    for(uint32_t i = 0; i < TEMP_HISTORY_POINTS; ++i) {
+        lv_chart_set_value_by_id(desktop_widgets.temperature_chart,
+                                 desktop_widgets.temperature_series,
+                                 i,
+                                 LV_CHART_POINT_NONE);
+    }
+
+    if(!local_valid || local_count == 0) {
+        lv_chart_set_range(desktop_widgets.temperature_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 500);
+        lv_chart_refresh(desktop_widgets.temperature_chart);
+        return;
+    }
+
+    float min_temp = local_history[0];
+    float max_temp = local_history[0];
+    for(size_t i = 1; i < local_count; ++i) {
+        if(local_history[i] < min_temp) {
+            min_temp = local_history[i];
+        }
+        if(local_history[i] > max_temp) {
+            max_temp = local_history[i];
+        }
+    }
+
+    int32_t range_min = (int32_t)(min_temp * 10.0f) - 5;
+    int32_t range_max = (int32_t)(max_temp * 10.0f) + 5;
+    if(range_max - range_min < 30) {
+        int32_t mid = (range_min + range_max) / 2;
+        range_min = mid - 15;
+        range_max = mid + 15;
+    }
+
+    lv_chart_set_range(desktop_widgets.temperature_chart,
+                       LV_CHART_AXIS_PRIMARY_Y,
+                       (lv_coord_t)range_min,
+                       (lv_coord_t)range_max);
+
+    size_t offset = TEMP_HISTORY_POINTS - local_count;
+    for(size_t i = 0; i < local_count; ++i) {
+        int32_t scaled = (int32_t)(local_history[i] * 10.0f);
+        lv_chart_set_value_by_id(desktop_widgets.temperature_chart,
+                                 desktop_widgets.temperature_series,
+                                 (uint32_t)(offset + i),
+                                 (lv_coord_t)scaled);
+    }
+
+    lv_chart_refresh(desktop_widgets.temperature_chart);
+}
 
 static const char *desktop_battery_symbol(int battery_percent, bool is_charging)
 {
@@ -231,6 +507,7 @@ static void desktop_refresh(lv_timer_t *timer)
     lv_label_set_text(desktop_widgets.date_label, date_text);
     lv_label_set_text(desktop_widgets.battery_label, battery_text);
     lv_label_set_text(desktop_widgets.status_label, status_text);
+    desktop_update_temperature_widgets();
 }
 
 static void desktop_set_brightness(uint8_t brightness)
@@ -345,8 +622,8 @@ static void desktop_create_ui(void)
     lv_obj_set_style_text_font(desktop_widgets.battery_label, &lv_font_montserrat_20, 0);
 
     lv_obj_t *hero_card = lv_obj_create(screen);
-    lv_obj_set_size(hero_card, lv_pct(100), 250);
-    lv_obj_align(hero_card, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_set_size(hero_card, lv_pct(100), 220);
+    lv_obj_align(hero_card, LV_ALIGN_CENTER, 0, -24);
     lv_obj_set_style_bg_color(hero_card, lv_color_hex(0x10284A), 0);
     lv_obj_set_style_bg_opa(hero_card, LV_OPA_80, 0);
     lv_obj_set_style_border_width(hero_card, 0, 0);
@@ -365,6 +642,47 @@ static void desktop_create_ui(void)
     lv_label_set_text(desktop_widgets.date_label, "Waiting for RTC");
     lv_obj_set_style_text_color(desktop_widgets.date_label, lv_color_hex(0xB8CAE6), 0);
     lv_obj_set_style_text_font(desktop_widgets.date_label, &lv_font_montserrat_20, 0);
+
+    desktop_widgets.temperature_label = lv_label_create(hero_card);
+    lv_label_set_text(desktop_widgets.temperature_label, "Temperature: --.- C");
+    lv_obj_set_style_text_color(desktop_widgets.temperature_label, lv_color_hex(0xD6E4FF), 0);
+    lv_obj_set_style_text_font(desktop_widgets.temperature_label, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *chart_card = lv_obj_create(screen);
+    lv_obj_set_size(chart_card, lv_pct(100), 125);
+    lv_obj_align(chart_card, LV_ALIGN_CENTER, 0, 142);
+    lv_obj_set_style_bg_color(chart_card, lv_color_hex(0x0E2240), 0);
+    lv_obj_set_style_bg_opa(chart_card, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(chart_card, 0, 0);
+    lv_obj_set_style_radius(chart_card, 24, 0);
+    lv_obj_set_style_pad_all(chart_card, 12, 0);
+
+    lv_obj_t *chart_title = lv_label_create(chart_card);
+    lv_label_set_text(chart_title, "Temperature history");
+    lv_obj_set_style_text_color(chart_title, lv_color_hex(0xD6E4FF), 0);
+    lv_obj_set_style_text_font(chart_title, &lv_font_montserrat_14, 0);
+    lv_obj_align(chart_title, LV_ALIGN_TOP_LEFT, 0, -4);
+
+    desktop_widgets.temperature_chart = lv_chart_create(chart_card);
+    lv_obj_set_size(desktop_widgets.temperature_chart, lv_pct(100), 90);
+    lv_obj_align(desktop_widgets.temperature_chart, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_opa(desktop_widgets.temperature_chart, LV_OPA_0, 0);
+    lv_obj_set_style_border_width(desktop_widgets.temperature_chart, 0, 0);
+    lv_chart_set_type(desktop_widgets.temperature_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_update_mode(desktop_widgets.temperature_chart, LV_CHART_UPDATE_MODE_SHIFT);
+    lv_chart_set_div_line_count(desktop_widgets.temperature_chart, 3, 6);
+    lv_chart_set_point_count(desktop_widgets.temperature_chart, TEMP_HISTORY_POINTS);
+    lv_chart_set_range(desktop_widgets.temperature_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 500);
+    desktop_widgets.temperature_series = lv_chart_add_series(desktop_widgets.temperature_chart,
+                                                             lv_color_hex(0x55D3FF),
+                                                             LV_CHART_AXIS_PRIMARY_Y);
+
+    for(uint32_t i = 0; i < TEMP_HISTORY_POINTS; ++i) {
+        lv_chart_set_value_by_id(desktop_widgets.temperature_chart,
+                                 desktop_widgets.temperature_series,
+                                 i,
+                                 LV_CHART_POINT_NONE);
+    }
 
     desktop_widgets.status_label = lv_label_create(screen);
     lv_label_set_text(desktop_widgets.status_label, "Initializing");
@@ -454,9 +772,25 @@ static void desktop_create_ui(void)
 void DesktopUI_Init(I2cMasterBus *i2c_bus, DisplayPort *display)
 {
     desktop_display = display;
+    if(temp_data_mutex == NULL) {
+        temp_data_mutex = xSemaphoreCreateMutex();
+    }
     desktop_init_rtc(i2c_bus);
     DesktopUI_SyncSystemTimeFromRtc();
     desktop_create_ui();
+}
+
+void DesktopUI_StartTelemetry(void)
+{
+    if(temp_task_started) {
+        return;
+    }
+
+    if(xTaskCreate(desktop_temperature_task, "desktop_temp", 8192, NULL, 3, NULL) == pdPASS) {
+        temp_task_started = true;
+    } else {
+        ESP_LOGW(TAG, "Failed to start desktop telemetry task");
+    }
 }
 
 void DesktopUI_ShowProvisioningQR(const char *service_name, const char *service_key, const char *qr_payload)

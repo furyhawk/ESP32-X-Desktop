@@ -114,6 +114,7 @@ extern "C" void app_main(void)
     (void)BoardAudio_PlayWelcomeSound();
 
     ESP_ERROR_CHECK(WifiProvisioning_Bootstrap());
+    DesktopUI_StartTelemetry();
 
     esp_err_t ret = qmi8658_init(&qmi8658, user_i2cbus.Get_I2cBusHandle(), QMI8658_ADDRESS_HIGH);
     if(ret != ESP_OK) {
