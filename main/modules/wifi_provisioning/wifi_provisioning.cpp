@@ -31,6 +31,7 @@ static bool wifi_mgr_initialized = false;
 static bool wifi_is_provisioning = false;
 static bool wifi_sntp_initialized = false;
 static bool wifi_is_connected = false;
+static bool wifi_ps_overridden_for_prov = false;
 static char prov_service_name[20] = {0};
 static char prov_qr_payload[200] = {0};
 static const char *SINGAPORE_TZ = "SGT-8";
@@ -132,9 +133,15 @@ static void get_device_service_name(char *service_name, size_t max_len)
 
 static void wifi_prov_print_url(const char *name, const char *username, const char *pop)
 {
-    snprintf(prov_qr_payload, sizeof(prov_qr_payload),
-             "{\"ver\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\"}",
-             PROV_QR_VERSION, name, username, pop, PROV_TRANSPORT_SOFTAP);
+    if(username != NULL && username[0] != '\0') {
+        snprintf(prov_qr_payload, sizeof(prov_qr_payload),
+                 "{\"ver\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\",\"network\":\"wifi\"}",
+                 PROV_QR_VERSION, name, username, pop, PROV_TRANSPORT_SOFTAP);
+    } else {
+        snprintf(prov_qr_payload, sizeof(prov_qr_payload),
+                 "{\"ver\":\"%s\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\",\"network\":\"wifi\"}",
+                 PROV_QR_VERSION, name, pop, PROV_TRANSPORT_SOFTAP);
+    }
 
     ESP_LOGI(TAG, "Provisioning URL:\n%s?data=%s", QRCODE_BASE_URL, prov_qr_payload);
 }
@@ -161,33 +168,40 @@ static esp_err_t wifi_prov_manager_init_if_needed(void)
 static esp_err_t wifi_start_softap_provisioning(void)
 {
     char service_name[16] = {0};
-    const char *username = "wifiprov";
+    const char *username = NULL;
     const char *pop = "abcd1234";
-    const char *service_key = "prov1234";
-    network_prov_security2_params_t sec2_params = {};
+    const char *service_key = NULL;
 
     get_device_service_name(service_name, sizeof(service_name));
     strncpy(prov_service_name, service_name, sizeof(prov_service_name) - 1);
     prov_service_name[sizeof(prov_service_name) - 1] = '\0';
 
-    sec2_params.salt = sec2_salt;
-    sec2_params.salt_len = sizeof(sec2_salt);
-    sec2_params.verifier = sec2_verifier;
-    sec2_params.verifier_len = sizeof(sec2_verifier);
+    /* Block normal STA reconnect flow while SoftAP provisioning is active. */
+    wifi_is_provisioning = true;
+    wifi_is_connected = false;
+    xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_EVENT);
 
-    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s)", service_name);
-    esp_err_t ret = network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_2,
-                                                        (const void *)&sec2_params,
+    if(!wifi_ps_overridden_for_prov) {
+        esp_err_t ps_ret = esp_wifi_set_ps(WIFI_PS_NONE);
+        if(ps_ret == ESP_OK) {
+            wifi_ps_overridden_for_prov = true;
+            ESP_LOGI(TAG, "Disabled Wi-Fi power save during provisioning");
+        } else {
+            ESP_LOGW(TAG, "Failed to disable Wi-Fi power save during provisioning (error: %d)", ps_ret);
+        }
+    }
+
+    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s, auth: open + sec1)", service_name);
+    esp_err_t ret = network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_1,
+                                                        (const void *)pop,
                                                         service_name,
                                                         service_key);
     if(ret != ESP_OK) {
+        wifi_is_provisioning = false;
         return ret;
     }
 
     wifi_prov_print_url(service_name, username, pop);
-    wifi_is_provisioning = true;
-    wifi_is_connected = false;
-    xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_EVENT);
     return ESP_OK;
 }
 
@@ -214,6 +228,13 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             ESP_ERROR_CHECK(network_prov_mgr_deinit());
             wifi_mgr_initialized = false;
             wifi_is_provisioning = false;
+            if(wifi_ps_overridden_for_prov) {
+                esp_err_t ps_ret = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+                if(ps_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to restore Wi-Fi power save after provisioning (error: %d)", ps_ret);
+                }
+                wifi_ps_overridden_for_prov = false;
+            }
             break;
         default:
             break;
@@ -221,13 +242,19 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
     } else if(event_base == WIFI_EVENT) {
         switch(event_id) {
         case WIFI_EVENT_STA_START:
-            esp_wifi_connect();
+            if(!wifi_is_provisioning) {
+                esp_wifi_connect();
+            }
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
-            ESP_LOGI(TAG, "Wi-Fi disconnected, retrying...");
             wifi_is_connected = false;
             xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_EVENT);
-            esp_wifi_connect();
+            if(wifi_is_provisioning) {
+                ESP_LOGI(TAG, "Wi-Fi STA disconnected during provisioning; reconnect suppressed");
+            } else {
+                ESP_LOGI(TAG, "Wi-Fi disconnected, retrying...");
+                esp_wifi_connect();
+            }
             break;
         case WIFI_EVENT_AP_STACONNECTED:
             ESP_LOGI(TAG, "Provisioning SoftAP client connected");
@@ -235,6 +262,15 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
         case WIFI_EVENT_AP_STADISCONNECTED:
             ESP_LOGI(TAG, "Provisioning SoftAP client disconnected");
             break;
+        case WIFI_EVENT_SCAN_DONE: {
+            const wifi_event_sta_scan_done_t *scan = (const wifi_event_sta_scan_done_t *)event_data;
+            if(scan != NULL) {
+                ESP_LOGI(TAG, "Provisioning scan done (status: %u, ap_num: %u)",
+                         (unsigned int)scan->status,
+                         (unsigned int)scan->number);
+            }
+            break;
+        }
         default:
             break;
         }

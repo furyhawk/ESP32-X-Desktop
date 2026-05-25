@@ -12,4 +12,6 @@ dependencies:
   waveshare/pcf85063a: ^1.1.1
   waveshare/qmi8658: ^1.0.1
   espressif/esp_lvgl_adapter: ^0.3.0
-  espressif/network_provisioning: "*"
+  espressif/network_provisioning:
+    version: "*"
+    override_path: ../components/network_provisioning

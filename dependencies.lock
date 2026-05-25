@@ -20,7 +20,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.7.19~2
   espressif/cmake_utilities:
@@ -229,20 +229,16 @@ dependencies:
       type: service
     version: 1.6.58
   espressif/network_provisioning:
-    component_hash: 72d27784e3daf807418a34fb00be136ec50c6db49d989ce981d22e031fc0e7f8
     dependencies:
     - name: espressif/cjson
-      registry_url: https://components.espressif.com
-      require: private
       rules:
       - if: idf_version >= 6.0
       version: ^1.7.19
     - name: idf
-      require: private
       version: '>=5.1'
     source:
-      registry_url: https://components.espressif.com/
-      type: service
+      path: components/network_provisioning
+      type: local
     version: 1.2.4
   espressif/zlib:
     component_hash: 64ea2fd6754c5a05951f1ddb312ac835cd782e68cb5bd9dfcd1c3a107c8fbfbc
@@ -300,6 +296,7 @@ dependencies:
       type: service
     version: 1.0.1
 direct_dependencies:
+- espressif/cjson
 - espressif/esp_codec_dev
 - espressif/esp_lcd_sh8601
 - espressif/esp_lvgl_adapter
@@ -309,6 +306,6 @@ direct_dependencies:
 - waveshare/esp_lcd_touch_cst9217
 - waveshare/pcf85063a
 - waveshare/qmi8658
-manifest_hash: 674b865190c20edea7d5cd705b9cf52cb0fdc7084c5249c466fb87ad5be9409e
+manifest_hash: d7f80c63188d128ef11ea954c98cf33d0ce1eeeb230509bb1d96b2729a01ca42
 target: esp32c6
 version: 3.0.0

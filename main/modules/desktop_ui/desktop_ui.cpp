@@ -221,7 +221,9 @@ static void desktop_temperature_task(void *arg)
     LV_UNUSED(arg);
 
     while(1) {
-        (void)desktop_fetch_temperature_history();
+        if(!WifiProvisioning_IsProvisioning()) {
+            (void)desktop_fetch_temperature_history();
+        }
         vTaskDelay(pdMS_TO_TICKS(TEMP_FETCH_INTERVAL_MS));
     }
 }
