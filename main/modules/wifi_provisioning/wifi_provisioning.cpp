@@ -674,6 +674,10 @@ static esp_err_t wifi_prov_manager_init_if_needed(void)
         /* Some Android stacks pause reads/writes during network handoff checks. */
         httpd_cfg.recv_wait_timeout = 30;
         httpd_cfg.send_wait_timeout = 30;
+        /* Captive-portal/captive-browser traffic may include large cookie and
+         * telemetry headers; default 512 bytes can trigger HTTP 431. */
+        httpd_cfg.max_req_hdr_len = 2048;
+        httpd_cfg.max_uri_len = 512;
         httpd_cfg.lru_purge_enable = true;
         /* Provisioning registers ~5 POST endpoints; +1 for our wildcard GET. */
         httpd_cfg.max_uri_handlers = 10;
