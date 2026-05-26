@@ -1126,6 +1126,32 @@ esp_err_t WifiProvisioning_Reprovision(void)
     return wifi_start_softap_provisioning();
 }
 
+esp_err_t WifiProvisioning_Cancel(void)
+{
+    if(!wifi_bootstrap_done) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if(!wifi_is_provisioning) {
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Cancelling active Wi-Fi provisioning");
+
+    /* Stop protocomm provisioning transport asynchronously. NETWORK_PROV_END will
+     * follow and finish manager teardown. */
+    network_prov_mgr_stop_provisioning();
+
+    /* Update state immediately so UI can dismiss provisioning overlay right away. */
+    wifi_is_provisioning = false;
+    wifi_is_connected = false;
+    if(wifi_event_group != NULL) {
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+    }
+
+    return ESP_OK;
+}
+
 bool WifiProvisioning_IsProvisioning(void)
 {
     return wifi_is_provisioning;

@@ -8,6 +8,9 @@
 #include <esp_timer.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
+#include <esp_system.h>
+#include <esp_flash.h>
+#include <esp_heap_caps.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -32,6 +35,12 @@ typedef struct {
     lv_obj_t *temperature_label;
     lv_obj_t *temperature_chart;
     lv_chart_series_t *temperature_series;
+    lv_obj_t *system_chip_label;
+    lv_obj_t *system_cpu_label;
+    lv_obj_t *system_flash_label;
+    lv_obj_t *system_psram_label;
+    lv_obj_t *system_heap_label;
+    lv_obj_t *system_idf_label;
 } desktop_widgets_t;
 
 static desktop_widgets_t desktop_widgets = {};
@@ -65,6 +74,47 @@ static float temp_latest_c = 0.0f;
 static float temp_history_c[TEMP_HISTORY_POINTS] = {};
 static size_t temp_history_count = 0;
 static bool temp_task_started = false;
+
+static void desktop_update_system_info_widgets(void)
+{
+    if(desktop_widgets.system_chip_label == NULL ||
+       desktop_widgets.system_cpu_label == NULL ||
+       desktop_widgets.system_flash_label == NULL ||
+       desktop_widgets.system_psram_label == NULL ||
+       desktop_widgets.system_heap_label == NULL ||
+       desktop_widgets.system_idf_label == NULL) {
+        return;
+    }
+
+    uint32_t cpu_mhz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+
+    uint32_t flash_size_bytes = 0;
+    esp_err_t flash_ret = esp_flash_get_size(NULL, &flash_size_bytes);
+    size_t psram_size_bytes = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    uint32_t free_heap_kb = esp_get_free_heap_size() / 1024U;
+
+    lv_label_set_text_fmt(desktop_widgets.system_chip_label, "Chip: %s", CONFIG_IDF_TARGET);
+    lv_label_set_text_fmt(desktop_widgets.system_cpu_label, "CPU: %lu MHz", (unsigned long)cpu_mhz);
+
+    if(flash_ret == ESP_OK && flash_size_bytes > 0) {
+        lv_label_set_text_fmt(desktop_widgets.system_flash_label,
+                              "Flash: %lu MB",
+                              (unsigned long)(flash_size_bytes / (1024U * 1024U)));
+    } else {
+        lv_label_set_text(desktop_widgets.system_flash_label, "Flash: --");
+    }
+
+    if(psram_size_bytes > 0) {
+        lv_label_set_text_fmt(desktop_widgets.system_psram_label,
+                              "PSRAM: %lu MB",
+                              (unsigned long)(psram_size_bytes / (1024U * 1024U)));
+    } else {
+        lv_label_set_text(desktop_widgets.system_psram_label, "PSRAM: none");
+    }
+
+    lv_label_set_text_fmt(desktop_widgets.system_heap_label, "Free heap: %lu KB", (unsigned long)free_heap_kb);
+    lv_label_set_text_fmt(desktop_widgets.system_idf_label, "IDF: %s", esp_get_idf_version());
+}
 
 static float desktop_parse_temperature_value(const cJSON *temp_item, bool *ok)
 {
@@ -653,6 +703,7 @@ static void desktop_refresh(lv_timer_t *timer)
     lv_label_set_text(desktop_widgets.date_label, date_text);
     lv_label_set_text(desktop_widgets.battery_label, battery_text);
     lv_label_set_text(desktop_widgets.status_label, status_text);
+    desktop_update_system_info_widgets();
     desktop_update_temperature_widgets();
 }
 
@@ -720,6 +771,25 @@ static void desktop_wifi_setup_event(lv_event_t *e)
     }
 
     DesktopUI_ShowProvisioningQR(svc_name, "prov1234", qr_payload);
+}
+
+static void desktop_wifi_cancel_provisioning_event(lv_event_t *e)
+{
+    LV_UNUSED(e);
+
+    esp_err_t ret = WifiProvisioning_Cancel();
+    if(ret != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to cancel Wi-Fi provisioning (error: %d)", ret);
+    }
+
+    if(prov_screen != NULL) {
+        lv_obj_delete(prov_screen);
+        prov_screen = NULL;
+    }
+
+    if(desktop_screen != NULL) {
+        lv_screen_load(desktop_screen);
+    }
 }
 
 static void desktop_init_rtc(I2cMasterBus *i2c_bus)
@@ -848,7 +918,7 @@ static void desktop_create_ui(void)
     lv_obj_center(settings_button_label);
 
     settings_panel = lv_obj_create(screen);
-    lv_obj_set_size(settings_panel, 420, 300);
+    lv_obj_set_size(settings_panel, 420, 390);
     lv_obj_align(settings_panel, LV_ALIGN_CENTER, 0, 26);
     lv_obj_set_style_bg_color(settings_panel, lv_color_hex(0x0E1D36), 0);
     lv_obj_set_style_bg_opa(settings_panel, LV_OPA_90, 0);
@@ -907,6 +977,46 @@ static void desktop_create_ui(void)
     lv_label_set_text(wifi_button_label, LV_SYMBOL_WIFI " Re-provision Wi-Fi");
     lv_obj_set_style_text_color(wifi_button_label, lv_color_hex(0xF7FAFF), 0);
     lv_obj_center(wifi_button_label);
+
+    lv_obj_t *system_tile = lv_obj_create(settings_panel);
+    lv_obj_set_size(system_tile, lv_pct(100), 124);
+    lv_obj_align(system_tile, LV_ALIGN_TOP_MID, 0, 242);
+    lv_obj_set_style_radius(system_tile, 14, 0);
+    lv_obj_set_style_bg_color(system_tile, lv_color_hex(0x142B4D), 0);
+    lv_obj_set_style_bg_opa(system_tile, LV_OPA_90, 0);
+    lv_obj_set_style_border_width(system_tile, 0, 0);
+    lv_obj_set_style_pad_all(system_tile, 10, 0);
+    lv_obj_set_layout(system_tile, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(system_tile, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(system_tile, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    lv_obj_t *system_title = lv_label_create(system_tile);
+    lv_label_set_text(system_title, "System Information");
+    lv_obj_set_style_text_color(system_title, lv_color_hex(0xF7FAFF), 0);
+    lv_obj_set_style_text_font(system_title, &lv_font_montserrat_14, 0);
+
+    desktop_widgets.system_chip_label = lv_label_create(system_tile);
+    desktop_widgets.system_cpu_label = lv_label_create(system_tile);
+    desktop_widgets.system_flash_label = lv_label_create(system_tile);
+    desktop_widgets.system_psram_label = lv_label_create(system_tile);
+    desktop_widgets.system_heap_label = lv_label_create(system_tile);
+    desktop_widgets.system_idf_label = lv_label_create(system_tile);
+
+    lv_obj_set_style_text_font(desktop_widgets.system_chip_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(desktop_widgets.system_cpu_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(desktop_widgets.system_flash_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(desktop_widgets.system_psram_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(desktop_widgets.system_heap_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(desktop_widgets.system_idf_label, &lv_font_montserrat_12, 0);
+
+    lv_obj_set_style_text_color(desktop_widgets.system_chip_label, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_set_style_text_color(desktop_widgets.system_cpu_label, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_set_style_text_color(desktop_widgets.system_flash_label, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_set_style_text_color(desktop_widgets.system_psram_label, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_set_style_text_color(desktop_widgets.system_heap_label, lv_color_hex(0xD8E4F8), 0);
+    lv_obj_set_style_text_color(desktop_widgets.system_idf_label, lv_color_hex(0xD8E4F8), 0);
+
+    desktop_update_system_info_widgets();
 
     lv_screen_load(screen);
     desktop_set_brightness(desktop_brightness);
@@ -978,10 +1088,22 @@ void DesktopUI_ShowProvisioningQR(const char *service_name, const char *service_
     lv_obj_align(connect_label, LV_ALIGN_BOTTOM_MID, 0, -34);
 
     lv_obj_t *hint_label = lv_label_create(prov_screen);
-    lv_label_set_text(hint_label, "Scan with Espressif Provisioning app");
+    lv_label_set_text(hint_label, "Scan with Espressif Provisioning app or cancel");
     lv_obj_set_style_text_color(hint_label, lv_color_hex(0x7A9DC4), 0);
     lv_obj_set_style_text_font(hint_label, &lv_font_montserrat_12, 0);
     lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    lv_obj_t *cancel_button = lv_btn_create(prov_screen);
+    lv_obj_set_size(cancel_button, 120, 44);
+    lv_obj_align(cancel_button, LV_ALIGN_BOTTOM_RIGHT, -8, -8);
+    lv_obj_set_style_radius(cancel_button, 14, 0);
+    lv_obj_set_style_bg_color(cancel_button, lv_color_hex(0x6B2430), 0);
+    lv_obj_add_event_cb(cancel_button, desktop_wifi_cancel_provisioning_event, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cancel_label = lv_label_create(cancel_button);
+    lv_label_set_text(cancel_label, LV_SYMBOL_CLOSE " Cancel");
+    lv_obj_set_style_text_color(cancel_label, lv_color_hex(0xFFF0F3), 0);
+    lv_obj_center(cancel_label);
 
     lv_screen_load(prov_screen);
 }

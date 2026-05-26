@@ -6,6 +6,8 @@ idf_component_register(
          audio_bsp
          app_bsp
          pmicpower
+         spi_flash
+         esp_psram
          nvs_flash
          esp_http_client
          esp_http_server

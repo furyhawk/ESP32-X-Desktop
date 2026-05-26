@@ -9,6 +9,9 @@ esp_err_t WifiProvisioning_Bootstrap(void);
 /** Clears saved Wi-Fi credentials and starts SoftAP provisioning again. */
 esp_err_t WifiProvisioning_Reprovision(void);
 
+/** Stops active SoftAP provisioning and returns device to normal Wi-Fi behavior. */
+esp_err_t WifiProvisioning_Cancel(void);
+
 /** Returns true if SoftAP provisioning is currently active (device not yet provisioned). */
 bool WifiProvisioning_IsProvisioning(void);
 
