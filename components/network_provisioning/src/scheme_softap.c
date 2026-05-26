@@ -46,11 +46,13 @@ static esp_err_t start_wifi_ap(const char *ssid, const char *pass)
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     } else {
         strlcpy((char *) wifi_config.ap.password, pass, sizeof(wifi_config.ap.password));
-        wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
+        wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        wifi_config.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
     }
 
-    /* Run Wi-Fi in AP + STA mode with configuration built above */
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    /* Run Wi-Fi in AP-only mode during provisioning.
+     * APSTA coexistence can cause client-side routing/DHCP instability on some hosts. */
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set Wi-Fi mode : %d", err);
         return err;
@@ -59,6 +61,13 @@ static esp_err_t start_wifi_ap(const char *ssid, const char *pass)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to set Wi-Fi config : %d", err);
         return err;
+    }
+
+    /* Force 20 MHz AP bandwidth for provisioning compatibility across hosts.
+     * Some clients struggle with HT40 SoftAPs and fail WPA handshakes. */
+    err = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set SoftAP bandwidth to HT20 : %d", err);
     }
 
     return ESP_OK;

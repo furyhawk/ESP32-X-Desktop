@@ -232,7 +232,7 @@ static esp_err_t cmd_get_status_handler(NetworkConfigPayload *req,
 static esp_err_t cmd_set_config_handler(NetworkConfigPayload *req,
                                         NetworkConfigPayload *resp, void  *priv_data)
 {
-    ESP_LOGD(TAG, "Enter cmd_set_config_handler");
+    ESP_LOGI(TAG, "prov-config: set command received (msg=%d)", req ? (int)req->msg : -1);
     network_prov_config_handlers_t *h = (network_prov_config_handlers_t *) priv_data;
     if (!h) {
         ESP_LOGE(TAG, "Command invoked without handlers");
@@ -263,13 +263,19 @@ static esp_err_t cmd_set_config_handler(NetworkConfigPayload *req,
          * If any of these conditions are not satisfied, don't invoke the handler and
          * send error status without closing connection */
         resp_payload->status = STATUS__InvalidArgument;
+        ESP_LOGI(TAG,
+                 "prov-config: set Wi-Fi payload lens ssid=%u pass=%u bssid=%u channel=%u",
+                 (unsigned)req->cmd_set_wifi_config->ssid.len,
+                 (unsigned)req->cmd_set_wifi_config->passphrase.len,
+                 (unsigned)req->cmd_set_wifi_config->bssid.len,
+                 (unsigned)req->cmd_set_wifi_config->channel);
         if (req->cmd_set_wifi_config->bssid.len != 0 &&
                 req->cmd_set_wifi_config->bssid.len != sizeof(req_data.bssid)) {
-            ESP_LOGD(TAG, "Received invalid BSSID");
+            ESP_LOGW(TAG, "prov-config: invalid BSSID length=%u", (unsigned)req->cmd_set_wifi_config->bssid.len);
         } else if (req->cmd_set_wifi_config->ssid.len >= sizeof(req_data.ssid)) {
-            ESP_LOGD(TAG, "Received invalid SSID");
+            ESP_LOGW(TAG, "prov-config: invalid SSID length=%u", (unsigned)req->cmd_set_wifi_config->ssid.len);
         } else if (req->cmd_set_wifi_config->passphrase.len >= sizeof(req_data.password)) {
-            ESP_LOGD(TAG, "Received invalid Passphrase");
+            ESP_LOGW(TAG, "prov-config: invalid passphrase length=%u", (unsigned)req->cmd_set_wifi_config->passphrase.len);
         } else {
             /* The received SSID and Passphrase are not NULL terminated so
              * we memcpy over zeroed out arrays. Above length checks ensure
@@ -283,8 +289,10 @@ static esp_err_t cmd_set_config_handler(NetworkConfigPayload *req,
             req_data.channel = req->cmd_set_wifi_config->channel;
             if (h->wifi_set_config_handler(&req_data, &h->ctx) == ESP_OK) {
                 resp_payload->status = STATUS__Success;
+                ESP_LOGI(TAG, "prov-config: set Wi-Fi config accepted");
             } else {
                 resp_payload->status = STATUS__InternalError;
+                ESP_LOGE(TAG, "prov-config: set Wi-Fi config handler failed");
             }
         }
 #else // CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
@@ -334,7 +342,7 @@ static esp_err_t cmd_set_config_handler(NetworkConfigPayload *req,
 static esp_err_t cmd_apply_config_handler(NetworkConfigPayload *req,
         NetworkConfigPayload *resp, void  *priv_data)
 {
-    ESP_LOGD(TAG, "Enter cmd_apply_config_handler");
+    ESP_LOGI(TAG, "prov-config: apply command received (msg=%d)", req ? (int)req->msg : -1);
     network_prov_config_handlers_t *h = (network_prov_config_handlers_t *) priv_data;
     if (!h) {
         ESP_LOGE(TAG, "Command invoked without handlers");
@@ -350,8 +358,10 @@ static esp_err_t cmd_apply_config_handler(NetworkConfigPayload *req,
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
         if (h->wifi_apply_config_handler && h->wifi_apply_config_handler(&h->ctx) == ESP_OK) {
             resp_payload->status = STATUS__Success;
+            ESP_LOGI(TAG, "prov-config: apply Wi-Fi config accepted");
         } else {
             resp_payload->status = STATUS__InternalError;
+            ESP_LOGE(TAG, "prov-config: apply Wi-Fi config failed");
         }
 #else // CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
         resp_payload->status = STATUS__InvalidArgument;
@@ -481,11 +491,11 @@ static esp_err_t network_prov_config_command_dispatcher(NetworkConfigPayload *re
 {
     esp_err_t ret;
 
-    ESP_LOGD(TAG, "In network_prov_config_command_dispatcher Cmd=%d", req->msg);
+    ESP_LOGI(TAG, "prov-config: dispatch command=%d", (int)req->msg);
 
     int cmd_index = lookup_cmd_handler(req->msg);
     if (cmd_index < 0) {
-        ESP_LOGE(TAG, "Invalid command handler lookup");
+        ESP_LOGE(TAG, "prov-config: unsupported command=%d", (int)req->msg);
         return ESP_FAIL;
     }
 
@@ -504,6 +514,9 @@ esp_err_t network_prov_config_data_handler(uint32_t session_id, const uint8_t *i
     NetworkConfigPayload *req;
     NetworkConfigPayload resp;
     esp_err_t ret;
+
+    ESP_LOGI(TAG, "prov-config: inbound packet session=%lu len=%d",
+             (unsigned long)session_id, (int)inlen);
 
     req = network_config_payload__unpack(NULL, inlen, inbuf);
     if (!req) {

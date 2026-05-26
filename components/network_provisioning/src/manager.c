@@ -314,8 +314,12 @@ static cJSON *network_prov_get_info_json(void)
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
     /* Indicate capability for performing Wi-Fi provision */
     cJSON_AddItemToArray(prov_capabilities, cJSON_CreateString("wifi_prov"));
-    /* Indicate capability for performing Wi-Fi scan */
+    /* Keep Wi-Fi scan capability for compatibility with provisioning apps
+     * that require it in their save/apply flow, even when scan results may be empty. */
     cJSON_AddItemToArray(prov_capabilities, cJSON_CreateString("wifi_scan"));
+    /* Indicate that client should allow manual SSID/password entry instead of
+     * relying on AP scan results. */
+    cJSON_AddItemToArray(prov_capabilities, cJSON_CreateString("no_scan"));
 #endif
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_THREAD
     /* Indicate capability for performing Thread provision */
@@ -1273,6 +1277,7 @@ bool network_prov_mgr_is_sm_idle(void)
 
 static void wifi_connect_timer_cb(void *arg)
 {
+    ESP_LOGI(TAG, "Starting Wi-Fi STA connect after provisioning delay");
     if (esp_wifi_connect() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to connect Wi-Fi");
     }
@@ -1302,8 +1307,9 @@ esp_err_t network_prov_mgr_configure_wifi_sta(wifi_config_t *wifi_cfg)
     debug_print_wifi_credentials(wifi_cfg->sta, "Received");
 
     /* Configure Wi-Fi as both AP and/or Station */
-    if (esp_wifi_set_mode(prov_ctx->mgr_config.scheme.wifi_mode) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set Wi-Fi mode");
+    esp_err_t wifi_ret = esp_wifi_set_mode(prov_ctx->mgr_config.scheme.wifi_mode);
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set Wi-Fi mode (err=%d)", wifi_ret);
         RELEASE_LOCK(prov_ctx_lock);
         return ESP_FAIL;
     }
@@ -1315,25 +1321,30 @@ esp_err_t network_prov_mgr_configure_wifi_sta(wifi_config_t *wifi_cfg)
 
     /* Set Wi-Fi storage again to flash to keep the newly
      * provided credentials on NVS */
-    if (esp_wifi_set_storage(WIFI_STORAGE_FLASH) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set storage Wi-Fi");
+    wifi_ret = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set storage Wi-Fi (err=%d)", wifi_ret);
         RELEASE_LOCK(prov_ctx_lock);
         return ESP_FAIL;
     }
     /* Configure Wi-Fi station with host credentials
      * provided during provisioning */
-    if (esp_wifi_set_config(WIFI_IF_STA, wifi_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set Wi-Fi configuration");
+    wifi_ret = esp_wifi_set_config(WIFI_IF_STA, wifi_cfg);
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set Wi-Fi configuration (err=%d)", wifi_ret);
         RELEASE_LOCK(prov_ctx_lock);
         return ESP_FAIL;
     }
-    /* Connect to AP after one second so that the response can
-     * be sent to the client successfully, before a channel change happens*/
-    if (esp_timer_start_once(prov_ctx->wifi_connect_timer, 1000 * 1000U) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start Wi-Fi connect timer");
+    /* Give the client extra time to receive the provisioning ACK before
+     * the STA association changes the SoftAP channel. */
+    wifi_ret = esp_timer_start_once(prov_ctx->wifi_connect_timer, 5000 * 1000U);
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Wi-Fi connect timer (err=%d)", wifi_ret);
         RELEASE_LOCK(prov_ctx_lock);
         return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG, "Wi-Fi STA credentials stored; connect timer armed for 5s");
 
     /* Reset Wi-Fi station state for provisioning app */
     prov_ctx->wifi_state = NETWORK_PROV_WIFI_STA_CONNECTING;

@@ -113,7 +113,11 @@ static esp_err_t wifi_set_config_handler(const network_prov_config_set_wifi_data
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGD(TAG, "Wi-Fi Credentials Received");
+    ESP_LOGI(TAG,
+             "Wi-Fi credentials received via prov-config (ssid_len=%u pass_len=%u channel=%u)",
+             (unsigned)strnlen(req_data->ssid, sizeof(wifi_cfg->sta.ssid)),
+             (unsigned)strnlen(req_data->password, sizeof(wifi_cfg->sta.password)),
+             (unsigned)req_data->channel);
 
     /* Using memcpy allows the max SSID length to be 32 bytes (as per 802.11 standard).
      * But this doesn't guarantee that the saved SSID will be null terminated, because
@@ -148,9 +152,9 @@ static esp_err_t wifi_apply_config_handler(network_prov_ctx_t **ctx)
 
     esp_err_t ret = network_prov_mgr_configure_wifi_sta(wifi_cfg);
     if (ret == ESP_OK) {
-        ESP_LOGD(TAG, "Wi-Fi Credentials Applied");
+        ESP_LOGI(TAG, "Wi-Fi credentials apply accepted by manager");
     } else {
-        ESP_LOGE(TAG, "Failed to apply Wi-Fi Credentials");
+        ESP_LOGE(TAG, "Failed to apply Wi-Fi credentials (err=%d)", ret);
     }
 
     free_network_prov_ctx(ctx);

@@ -8,6 +8,7 @@ idf_component_register(
          pmicpower
          nvs_flash
          esp_http_client
+         esp_http_server
          espressif__cjson
          mbedtls
     EMBED_TXTFILES

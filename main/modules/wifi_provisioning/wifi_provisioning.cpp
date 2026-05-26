@@ -7,10 +7,15 @@
 #include <freertos/event_groups.h>
 
 #include <esp_event.h>
+#include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_netif_sntp.h>
+#include <esp_random.h>
 #include <esp_wifi.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
+#include <lwip/ip4_addr.h>
 #include <nvs_flash.h>
 
 #include <network_provisioning/manager.h>
@@ -32,9 +37,17 @@ static bool wifi_is_provisioning = false;
 static bool wifi_sntp_initialized = false;
 static bool wifi_is_connected = false;
 static bool wifi_ps_overridden_for_prov = false;
+static httpd_handle_t prov_httpd_handle = NULL;
+static esp_netif_t *wifi_ap_netif = NULL;
+static TaskHandle_t captive_dns_task_handle = NULL;
+static int captive_dns_sock = -1;
+static esp_ip4_addr_t captive_dns_ip = {0};
 static char prov_service_name[20] = {0};
 static char prov_qr_payload[200] = {0};
 static const char *SINGAPORE_TZ = "SGT-8";
+
+#define CAPTIVE_DNS_PORT 53
+#define CAPTIVE_DNS_MAX_PACKET 512
 
 /* Security-2 development credentials copied from Espressif provisioning example. */
 static const char sec2_salt[] = {
@@ -73,6 +86,219 @@ static void wifi_set_singapore_timezone(void)
 {
     setenv("TZ", SINGAPORE_TZ, 1);
     tzset();
+}
+
+static int captive_dns_read_qname_end(const uint8_t *msg, int msg_len, int qname_offset)
+{
+    int idx = qname_offset;
+    while(idx < msg_len) {
+        uint8_t label_len = msg[idx++];
+        if(label_len == 0) {
+            return idx;
+        }
+        if((label_len & 0xC0) != 0 || (idx + label_len) > msg_len) {
+            return -1;
+        }
+        idx += label_len;
+    }
+    return -1;
+}
+
+static void captive_dns_qname_to_string(const uint8_t *msg,
+                                        int msg_len,
+                                        int qname_offset,
+                                        char *out,
+                                        size_t out_len)
+{
+    if(out == NULL || out_len == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    int idx = qname_offset;
+    size_t w = 0;
+
+    while(idx < msg_len) {
+        uint8_t label_len = msg[idx++];
+        if(label_len == 0) {
+            break;
+        }
+        if((label_len & 0xC0) != 0 || (idx + label_len) > msg_len) {
+            break;
+        }
+
+        if(w > 0 && (w + 1) < out_len) {
+            out[w++] = '.';
+        }
+
+        for(uint8_t i = 0; i < label_len && (w + 1) < out_len; ++i) {
+            out[w++] = (char)msg[idx + i];
+        }
+        idx += label_len;
+    }
+
+    out[w] = '\0';
+}
+
+static int captive_dns_build_a_response(const uint8_t *query,
+                                        int query_len,
+                                        uint8_t *response,
+                                        int response_cap,
+                                        esp_ip4_addr_t ip)
+{
+    if(query_len < 12 || response_cap < 12) {
+        return -1;
+    }
+
+    uint16_t flags = ((uint16_t)query[2] << 8) | query[3];
+    uint16_t qdcount = ((uint16_t)query[4] << 8) | query[5];
+    if((flags & 0x8000U) != 0 || qdcount == 0) {
+        return -1;
+    }
+
+    int qname_end = captive_dns_read_qname_end(query, query_len, 12);
+    if(qname_end < 0 || (qname_end + 4) > query_len) {
+        return -1;
+    }
+
+    int question_len = (qname_end + 4) - 12;
+    int answer_len = 16; /* name ptr + type + class + ttl + rdlen + ipv4 */
+    int total_len = 12 + question_len + answer_len;
+    if(total_len > response_cap) {
+        return -1;
+    }
+
+    memcpy(response, query, 12 + question_len);
+    response[2] = 0x81; /* QR=1, OPCODE=0, AA=0, TC=0, RD preserved */
+    response[3] = 0x80; /* RA=1, RCODE=0 */
+    response[4] = query[4];
+    response[5] = query[5];
+    response[6] = 0x00;
+    response[7] = 0x01; /* one answer */
+    response[8] = 0x00;
+    response[9] = 0x00;
+    response[10] = 0x00;
+    response[11] = 0x00;
+
+    int a = 12 + question_len;
+    response[a++] = 0xC0;
+    response[a++] = 0x0C; /* pointer to first question name */
+    response[a++] = 0x00;
+    response[a++] = 0x01; /* type A */
+    response[a++] = 0x00;
+    response[a++] = 0x01; /* class IN */
+    response[a++] = 0x00;
+    response[a++] = 0x00;
+    response[a++] = 0x00;
+    response[a++] = 0x3C; /* ttl 60s */
+    response[a++] = 0x00;
+    response[a++] = 0x04; /* ipv4 length */
+    ip4_addr_t ip4 = {0};
+    ip4.addr = ip.addr;
+    response[a++] = ip4_addr1(&ip4);
+    response[a++] = ip4_addr2(&ip4);
+    response[a++] = ip4_addr3(&ip4);
+    response[a++] = ip4_addr4(&ip4);
+
+    return total_len;
+}
+
+static void captive_dns_server_task(void *arg)
+{
+    (void)arg;
+
+    uint8_t rx_buf[CAPTIVE_DNS_MAX_PACKET] = {0};
+    uint8_t tx_buf[CAPTIVE_DNS_MAX_PACKET] = {0};
+
+    while(captive_dns_sock >= 0) {
+        struct sockaddr_storage src_addr;
+        memset(&src_addr, 0, sizeof(src_addr));
+        socklen_t src_len = sizeof(src_addr);
+        int rlen = recvfrom(captive_dns_sock, rx_buf, sizeof(rx_buf), 0,
+                            (struct sockaddr *)&src_addr, &src_len);
+        if(rlen <= 0) {
+            continue;
+        }
+
+        char qname[96] = {0};
+        captive_dns_qname_to_string(rx_buf, rlen, 12, qname, sizeof(qname));
+        ESP_LOGI(TAG,
+                 "Captive DNS query: host=%s (%d bytes) -> " IPSTR,
+                 qname[0] != '\0' ? qname : "(unknown)",
+                 rlen,
+                 IP2STR(&captive_dns_ip));
+
+        int tlen = captive_dns_build_a_response(rx_buf, rlen, tx_buf, sizeof(tx_buf), captive_dns_ip);
+        if(tlen > 0) {
+            sendto(captive_dns_sock, tx_buf, tlen, 0, (struct sockaddr *)&src_addr, src_len);
+        }
+    }
+
+    captive_dns_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t captive_dns_server_start(void)
+{
+    if(captive_dns_sock >= 0) {
+        return ESP_OK;
+    }
+
+    if(wifi_ap_netif == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_netif_ip_info_t ap_ip;
+    memset(&ap_ip, 0, sizeof(ap_ip));
+    esp_err_t ret = esp_netif_get_ip_info(wifi_ap_netif, &ap_ip);
+    if(ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read SoftAP IP for captive DNS (error: %d)", ret);
+        return ret;
+    }
+    captive_dns_ip = ap_ip.ip;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if(sock < 0) {
+        ESP_LOGW(TAG, "Failed to create captive DNS socket");
+        return ESP_FAIL;
+    }
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(CAPTIVE_DNS_PORT);
+    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if(bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
+        ESP_LOGW(TAG, "Failed to bind captive DNS socket");
+        close(sock);
+        return ESP_FAIL;
+    }
+
+    captive_dns_sock = sock;
+
+    BaseType_t task_ok = xTaskCreate(captive_dns_server_task,
+                                     "captive_dns",
+                                     4096,
+                                     NULL,
+                                     5,
+                                     &captive_dns_task_handle);
+    if(task_ok != pdPASS) {
+        close(captive_dns_sock);
+        captive_dns_sock = -1;
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "Captive DNS started on %s:53", ip4addr_ntoa((const ip4_addr_t *)&captive_dns_ip));
+    return ESP_OK;
+}
+
+static void captive_dns_server_stop(void)
+{
+    if(captive_dns_sock >= 0) {
+        close(captive_dns_sock);
+        captive_dns_sock = -1;
+    }
+    ESP_LOGI(TAG, "Captive DNS stopped");
 }
 
 static void wifi_time_sync_cb(struct timeval *tv)
@@ -127,30 +353,194 @@ static void wifi_init_sta(void)
 static void get_device_service_name(char *service_name, size_t max_len)
 {
     uint8_t mac[6] = {0};
+    uint32_t nonce = esp_random();
     esp_wifi_get_mac(WIFI_IF_STA, mac);
-    snprintf(service_name, max_len, "PROV_%02X%02X%02X", mac[3], mac[4], mac[5]);
+    /* Use a per-run nonce suffix so Android does not silently auto-join a stale
+     * remembered SSID and bypass the provisioning app network selection flow. */
+    snprintf(service_name, max_len, "PROV_%02X%02X%02X%02X",
+             mac[4], mac[5], (unsigned int)((nonce >> 8) & 0xFF), (unsigned int)(nonce & 0xFF));
 }
 
-static void wifi_prov_print_url(const char *name, const char *username, const char *pop)
+static void wifi_prov_print_url(const char *name,
+                                const char *username,
+                                const char *pop,
+                                int security,
+                                const char *password)
 {
-    if(username != NULL && username[0] != '\0') {
-        snprintf(prov_qr_payload, sizeof(prov_qr_payload),
-                 "{\"ver\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\",\"network\":\"wifi\"}",
-                 PROV_QR_VERSION, name, username, pop, PROV_TRANSPORT_SOFTAP);
+    char password_field[96] = {0};
+    if(password != NULL && password[0] != '\0') {
+        snprintf(password_field, sizeof(password_field), ",\"password\":\"%s\"", password);
+    }
+
+    if(pop != NULL && pop[0] != '\0') {
+        if(username != NULL && username[0] != '\0') {
+            snprintf(prov_qr_payload, sizeof(prov_qr_payload),
+                     "{\"ver\":\"%s\",\"name\":\"%s\",\"username\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\",\"security\":%d%s}",
+                     PROV_QR_VERSION,
+                     name,
+                     username,
+                     pop,
+                     PROV_TRANSPORT_SOFTAP,
+                     security,
+                     password_field);
+        } else {
+            snprintf(prov_qr_payload, sizeof(prov_qr_payload),
+                     "{\"ver\":\"%s\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\",\"security\":%d%s}",
+                     PROV_QR_VERSION,
+                     name,
+                     pop,
+                     PROV_TRANSPORT_SOFTAP,
+                     security,
+                     password_field);
+        }
     } else {
         snprintf(prov_qr_payload, sizeof(prov_qr_payload),
-                 "{\"ver\":\"%s\",\"name\":\"%s\",\"pop\":\"%s\",\"transport\":\"%s\",\"network\":\"wifi\"}",
-                 PROV_QR_VERSION, name, pop, PROV_TRANSPORT_SOFTAP);
+                 "{\"ver\":\"%s\",\"name\":\"%s\",\"transport\":\"%s\",\"security\":%d%s}",
+                 PROV_QR_VERSION,
+                 name,
+                 PROV_TRANSPORT_SOFTAP,
+                 security,
+                 password_field);
     }
 
     ESP_LOGI(TAG, "Provisioning URL:\n%s?data=%s", QRCODE_BASE_URL, prov_qr_payload);
 }
+
+/* Respond to Android captive-portal probes (any GET) with HTTP 204 so Android
+ * considers the SoftAP network valid and does not drop the connection before
+ * the provisioning app has a chance to exchange credentials. */
+static esp_err_t prov_captive_portal_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Captive portal probe intercepted: %s", req->uri);
+    /* 204 No Content: tells Android/iOS the network has internet access. */
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t prov_diag_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Provisioning diag GET hit: %s", req->uri);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"service\":\"provisioning-httpd\"}");
+}
+
+static esp_err_t prov_diag_post_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Provisioning diag POST hit: %s (len=%d)", req->uri, req->content_len);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"method\":\"post\"}");
+}
+
+static esp_err_t prov_httpd_err_handler(httpd_req_t *req, httpd_err_code_t error)
+{
+    if(req != NULL) {
+        ESP_LOGW(TAG, "Provisioning HTTP miss (method=%d, uri=%s, err=%d)",
+                 (int)req->method,
+                 req->uri != NULL ? req->uri : "(null)",
+                 (int)error);
+    } else {
+        ESP_LOGW(TAG, "Provisioning HTTP miss (null req, err=%d)", (int)error);
+    }
+
+    if(req != NULL && (error == HTTPD_404_NOT_FOUND || error == HTTPD_405_METHOD_NOT_ALLOWED)) {
+        return httpd_resp_send_err(req, error, NULL);
+    }
+    return ESP_FAIL;
+}
+
+static const httpd_uri_t prov_captive_portal_uri = {
+    .uri      = "/*",          /* wildcard: catches /generate_204 and friends */
+    .method   = HTTP_GET,
+    .handler  = prov_captive_portal_handler,
+    .user_ctx = NULL
+};
+
+static const httpd_uri_t prov_diag_get_uri = {
+    .uri      = "/diag",
+    .method   = HTTP_GET,
+    .handler  = prov_diag_get_handler,
+    .user_ctx = NULL
+};
+
+static const httpd_uri_t prov_diag_post_uri = {
+    .uri      = "/diag",
+    .method   = HTTP_POST,
+    .handler  = prov_diag_post_handler,
+    .user_ctx = NULL
+};
 
 static esp_err_t wifi_prov_manager_init_if_needed(void)
 {
     if(wifi_mgr_initialized) {
         return ESP_OK;
     }
+
+    if(prov_httpd_handle == NULL) {
+        httpd_config_t httpd_cfg = HTTPD_DEFAULT_CONFIG();
+        /* Some Android stacks pause reads/writes during network handoff checks. */
+        httpd_cfg.recv_wait_timeout = 30;
+        httpd_cfg.send_wait_timeout = 30;
+        httpd_cfg.lru_purge_enable = true;
+        /* Provisioning registers ~5 POST endpoints; +1 for our wildcard GET. */
+        httpd_cfg.max_uri_handlers = 10;
+        /* Required for wildcard URI matching ("slash-star") to work; provisioning
+         * POST endpoints are exact matches and still take priority. */
+        httpd_cfg.uri_match_fn = httpd_uri_match_wildcard;
+        esp_err_t httpd_ret = httpd_start(&prov_httpd_handle, &httpd_cfg);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start provisioning HTTPD (error: %d)", httpd_ret);
+            return httpd_ret;
+        }
+
+        httpd_ret = httpd_register_uri_handler(prov_httpd_handle, &prov_diag_get_uri);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register /diag GET handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+        ESP_LOGI(TAG, "Provisioning diag endpoint registered: GET /diag");
+
+        httpd_ret = httpd_register_uri_handler(prov_httpd_handle, &prov_diag_post_uri);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register /diag POST handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+        ESP_LOGI(TAG, "Provisioning diag endpoint registered: POST /diag");
+
+        /* Register wildcard GET handler for Android captive-portal detection. */
+        httpd_ret = httpd_register_uri_handler(prov_httpd_handle, &prov_captive_portal_uri);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register captive-portal handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+
+        httpd_ret = httpd_register_err_handler(prov_httpd_handle, HTTPD_404_NOT_FOUND, prov_httpd_err_handler);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register HTTP 404 handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+
+        httpd_ret = httpd_register_err_handler(prov_httpd_handle, HTTPD_405_METHOD_NOT_ALLOWED, prov_httpd_err_handler);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register HTTP 405 handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+
+        ESP_LOGI(TAG, "Captive-portal wildcard handler registered");
+    }
+
+    /* protocomm expects a pointer to httpd_handle_t storage, not the raw handle value. */
+    network_prov_scheme_softap_set_httpd_handle((void *)&prov_httpd_handle);
 
     network_prov_mgr_config_t prov_cfg = {};
     prov_cfg.scheme = network_prov_scheme_softap;
@@ -168,15 +558,39 @@ static esp_err_t wifi_prov_manager_init_if_needed(void)
 static esp_err_t wifi_start_softap_provisioning(void)
 {
     char service_name[16] = {0};
-    const char *username = "wifiprov";
+    int security_ver = 0;
     const char *pop = "abcd1234";
     const char *service_key = NULL;
-    network_prov_security2_params_t sec2_params = {};
+    const char *username = NULL;
+    const char *security_label = NULL;
+    const char *ap_auth_label = "open";
+    network_prov_security_t security;
+    const void *security_params;
 
+#if CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
+    security = NETWORK_PROV_SECURITY_1;
+    security_ver = 1;
+    security_params = (const void *)pop;
+    security_label = "sec1";
+#elif CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_2
+    network_prov_security2_params_t sec2_params = {};
     sec2_params.salt = sec2_salt;
     sec2_params.salt_len = sizeof(sec2_salt);
     sec2_params.verifier = sec2_verifier;
     sec2_params.verifier_len = sizeof(sec2_verifier);
+    security = NETWORK_PROV_SECURITY_2;
+    security_ver = 2;
+    security_params = (const void *)&sec2_params;
+    username = "wifiprov";
+    security_label = "sec2";
+#elif CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0
+    security = NETWORK_PROV_SECURITY_0;
+    security_ver = 0;
+    security_params = NULL;
+    security_label = "sec0";
+#else
+#error "At least one protocomm security version must be enabled"
+#endif
 
     get_device_service_name(service_name, sizeof(service_name));
     strncpy(prov_service_name, service_name, sizeof(prov_service_name) - 1);
@@ -197,9 +611,16 @@ static esp_err_t wifi_start_softap_provisioning(void)
         }
     }
 
-    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s, auth: open + sec2)", service_name);
-    esp_err_t ret = network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_2,
-                                                        (const void *)&sec2_params,
+    if(service_key == NULL || service_key[0] == '\0') {
+        ap_auth_label = "open";
+    }
+
+    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s, auth: %s + %s)",
+             service_name,
+             ap_auth_label,
+             security_label);
+    esp_err_t ret = network_prov_mgr_start_provisioning(security,
+                                                        security_params,
                                                         service_name,
                                                         service_key);
     if(ret != ESP_OK) {
@@ -207,7 +628,14 @@ static esp_err_t wifi_start_softap_provisioning(void)
         return ret;
     }
 
-    wifi_prov_print_url(service_name, username, pop);
+    ret = captive_dns_server_start();
+    if(ret != ESP_OK) {
+        ESP_LOGW(TAG, "Captive DNS did not start (error: %d)", ret);
+    }
+
+    ESP_LOGI(TAG, "Diag URL (while connected to SoftAP): http://192.168.4.1/diag");
+
+    wifi_prov_print_url(service_name, username, pop, security_ver, service_key);
     return ESP_OK;
 }
 
@@ -231,6 +659,7 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             break;
         case NETWORK_PROV_END:
             ESP_LOGI(TAG, "Provisioning ended, deinitializing manager");
+            captive_dns_server_stop();
             ESP_ERROR_CHECK(network_prov_mgr_deinit());
             wifi_mgr_initialized = false;
             wifi_is_provisioning = false;
@@ -241,12 +670,47 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
                 }
                 wifi_ps_overridden_for_prov = false;
             }
+            if(prov_httpd_handle != NULL) {
+                esp_err_t httpd_ret = httpd_stop(prov_httpd_handle);
+                if(httpd_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to stop provisioning HTTPD (error: %d)", httpd_ret);
+                }
+                prov_httpd_handle = NULL;
+            }
             break;
         default:
             break;
         }
+    } else if(event_base == PROTOCOMM_SECURITY_SESSION_EVENT) {
+        switch(event_id) {
+        case PROTOCOMM_SECURITY_SESSION_SETUP_OK:
+            ESP_LOGI(TAG, "Provisioning secure session established");
+            break;
+        case PROTOCOMM_SECURITY_SESSION_INVALID_SECURITY_PARAMS:
+            ESP_LOGE(TAG, "Provisioning secure session failed: invalid security params");
+            break;
+        case PROTOCOMM_SECURITY_SESSION_CREDENTIALS_MISMATCH:
+            ESP_LOGE(TAG, "Provisioning secure session failed: incorrect PoP/credentials");
+            break;
+        default:
+            ESP_LOGW(TAG, "Provisioning secure session event id: %ld", (long)event_id);
+            break;
+        }
     } else if(event_base == WIFI_EVENT) {
         switch(event_id) {
+        case WIFI_EVENT_AP_START:
+            ESP_LOGI(TAG, "Provisioning SoftAP started");
+            if(wifi_ap_netif != NULL) {
+                esp_err_t dhcp_ret = esp_netif_dhcps_start(wifi_ap_netif);
+                if(dhcp_ret == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+                    ESP_LOGI(TAG, "SoftAP DHCP server already running");
+                } else if(dhcp_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "SoftAP DHCP server start failed (error: %d)", dhcp_ret);
+                } else {
+                    ESP_LOGI(TAG, "SoftAP DHCP server started/restarted on AP start event");
+                }
+            }
+            break;
         case WIFI_EVENT_STA_START:
             if(!wifi_is_provisioning) {
                 esp_wifi_connect();
@@ -263,10 +727,46 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             }
             break;
         case WIFI_EVENT_AP_STACONNECTED:
-            ESP_LOGI(TAG, "Provisioning SoftAP client connected");
+            if(event_data != NULL) {
+                const wifi_event_ap_staconnected_t *ap_conn = (const wifi_event_ap_staconnected_t *)event_data;
+                ESP_LOGI(TAG,
+                         "Provisioning SoftAP client connected: %02x:%02x:%02x:%02x:%02x:%02x (AID=%u)",
+                         ap_conn->mac[0], ap_conn->mac[1], ap_conn->mac[2],
+                         ap_conn->mac[3], ap_conn->mac[4], ap_conn->mac[5],
+                         (unsigned int)ap_conn->aid);
+            } else {
+                ESP_LOGI(TAG, "Provisioning SoftAP client connected");
+            }
+
+            if(wifi_ap_netif != NULL) {
+                esp_err_t dhcp_ret = esp_netif_dhcps_start(wifi_ap_netif);
+                if(dhcp_ret == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+                    ESP_LOGI(TAG, "SoftAP DHCP already running at client connect");
+                } else if(dhcp_ret == ESP_OK) {
+                    ESP_LOGI(TAG, "SoftAP DHCP restarted at client connect");
+                } else {
+                    ESP_LOGW(TAG, "SoftAP DHCP start failed at client connect (error: %d)", dhcp_ret);
+                }
+            }
             break;
         case WIFI_EVENT_AP_STADISCONNECTED:
-            ESP_LOGI(TAG, "Provisioning SoftAP client disconnected");
+            if(event_data != NULL) {
+                const wifi_event_ap_stadisconnected_t *ap_disc = (const wifi_event_ap_stadisconnected_t *)event_data;
+                ESP_LOGI(TAG,
+                         "Provisioning SoftAP client disconnected: %02x:%02x:%02x:%02x:%02x:%02x (AID=%u, reason=%u)",
+                         ap_disc->mac[0], ap_disc->mac[1], ap_disc->mac[2],
+                         ap_disc->mac[3], ap_disc->mac[4], ap_disc->mac[5],
+                         (unsigned int)ap_disc->aid,
+                         (unsigned int)ap_disc->reason);
+            } else {
+                ESP_LOGI(TAG, "Provisioning SoftAP client disconnected");
+            }
+            break;
+        case WIFI_EVENT_AP_WRONG_PASSWORD:
+            ESP_LOGW(TAG, "Provisioning SoftAP auth failure: station used wrong password");
+            break;
+        case WIFI_EVENT_HOME_CHANNEL_CHANGE:
+            ESP_LOGI(TAG, "Provisioning SoftAP home channel changed");
             break;
         case WIFI_EVENT_SCAN_DONE: {
             const wifi_event_sta_scan_done_t *scan = (const wifi_event_sta_scan_done_t *)event_data;
@@ -278,14 +778,30 @@ static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_
             break;
         }
         default:
+            ESP_LOGI(TAG, "WIFI_EVENT id: %ld", (long)event_id);
             break;
         }
-    } else if(event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Connected with IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        wifi_is_connected = true;
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
-        wifi_start_time_sync();
+    } else if(event_base == IP_EVENT) {
+        switch(event_id) {
+        case IP_EVENT_STA_GOT_IP: {
+            ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+            ESP_LOGI(TAG, "Connected with IP: " IPSTR, IP2STR(&event->ip_info.ip));
+            wifi_is_connected = true;
+            xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_EVENT);
+            wifi_start_time_sync();
+            break;
+        }
+        case IP_EVENT_ASSIGNED_IP_TO_CLIENT: {
+            const ip_event_assigned_ip_to_client_t *event = (const ip_event_assigned_ip_to_client_t *)event_data;
+            ESP_LOGI(TAG,
+                     "SoftAP DHCP lease: client %02x:%02x:%02x:%02x:%02x:%02x -> " IPSTR,
+                     event->mac[0], event->mac[1], event->mac[2], event->mac[3], event->mac[4], event->mac[5],
+                     IP2STR(&event->ip));
+            break;
+        }
+        default:
+            break;
+        }
     }
 }
 
@@ -311,11 +827,13 @@ esp_err_t WifiProvisioning_Bootstrap(void)
     wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(PROTOCOMM_SECURITY_SESSION_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ASSIGNED_IP_TO_CLIENT, &event_handler, NULL));
 
     esp_netif_create_default_wifi_sta();
-    esp_netif_create_default_wifi_ap();
+    wifi_ap_netif = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
