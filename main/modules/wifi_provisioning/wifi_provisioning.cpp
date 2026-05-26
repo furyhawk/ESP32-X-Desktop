@@ -168,9 +168,15 @@ static esp_err_t wifi_prov_manager_init_if_needed(void)
 static esp_err_t wifi_start_softap_provisioning(void)
 {
     char service_name[16] = {0};
-    const char *username = NULL;
+    const char *username = "wifiprov";
     const char *pop = "abcd1234";
     const char *service_key = NULL;
+    network_prov_security2_params_t sec2_params = {};
+
+    sec2_params.salt = sec2_salt;
+    sec2_params.salt_len = sizeof(sec2_salt);
+    sec2_params.verifier = sec2_verifier;
+    sec2_params.verifier_len = sizeof(sec2_verifier);
 
     get_device_service_name(service_name, sizeof(service_name));
     strncpy(prov_service_name, service_name, sizeof(prov_service_name) - 1);
@@ -191,9 +197,9 @@ static esp_err_t wifi_start_softap_provisioning(void)
         }
     }
 
-    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s, auth: open + sec1)", service_name);
-    esp_err_t ret = network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_1,
-                                                        (const void *)pop,
+    ESP_LOGI(TAG, "Starting SoftAP provisioning (service name: %s, auth: open + sec2)", service_name);
+    esp_err_t ret = network_prov_mgr_start_provisioning(NETWORK_PROV_SECURITY_2,
+                                                        (const void *)&sec2_params,
                                                         service_name,
                                                         service_key);
     if(ret != ESP_OK) {
