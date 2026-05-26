@@ -13,6 +13,7 @@
 #include <esp_netif_sntp.h>
 #include <esp_random.h>
 #include <esp_wifi.h>
+#include <cJSON.h>
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 #include <lwip/ip4_addr.h>
@@ -408,28 +409,206 @@ static void wifi_prov_print_url(const char *name,
 
 /* Respond to Android captive-portal probes (any GET) with HTTP 204 so Android
  * considers the SoftAP network valid and does not drop the connection before
- * the provisioning app has a chance to exchange credentials. */
+ * the provisioning app has a chance to exchange credentials.
+ *
+ * For the manual fallback flow, return a redirect to /diag so the phone opens
+ * the local credential page instead of silently treating the network as normal. */
 static esp_err_t prov_captive_portal_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Captive portal probe intercepted: %s", req->uri);
-    /* 204 No Content: tells Android/iOS the network has internet access. */
-    httpd_resp_set_status(req, "204 No Content");
-    httpd_resp_send(req, NULL, 0);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/diag");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req,
+                       "<html><head><meta http-equiv=\"refresh\" content=\"0; url=/diag\"></head>"
+                       "<body>Open <a href=\"/diag\">/diag</a> to continue Wi-Fi setup.</body></html>");
     return ESP_OK;
 }
 
 static esp_err_t prov_diag_get_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Provisioning diag GET hit: %s", req->uri);
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"ok\":true,\"service\":\"provisioning-httpd\"}");
+    static const char diag_html[] =
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>ESP32 Wi-Fi Setup</title>"
+        "<style>body{font-family:sans-serif;max-width:520px;margin:24px auto;padding:0 14px;}"
+        "label{display:block;margin-top:12px;font-weight:600;}"
+        "input{width:100%;padding:10px;margin-top:6px;box-sizing:border-box;}"
+        "button{margin-top:16px;padding:10px 14px;}"
+        "pre{background:#f3f3f3;padding:10px;white-space:pre-wrap;}"
+        "</style></head><body>"
+        "<h2>ESP32 Manual Wi-Fi Provisioning</h2>"
+        "<p>If app provisioning fails, use this form.</p>"
+        "<form action=\"/\" method=\"post\">"
+        "<label>SSID<input name=\"ssid\" autocomplete=\"off\" required></label>"
+        "<label>Password<input name=\"password\" type=\"password\" autocomplete=\"off\"></label>"
+        "<button type=\"submit\">Save And Connect</button>"
+        "</form>"
+        "<p>Or POST JSON to <code>/</code> or <code>/diag</code> with <code>{&quot;ssid&quot;:&quot;...&quot;,&quot;password&quot;:&quot;...&quot;}</code>.</p>"
+        "</body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, diag_html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t wifi_apply_manual_credentials(const char *ssid, const char *password)
+{
+    if(ssid == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t ssid_len = strnlen(ssid, sizeof(((wifi_sta_config_t *)0)->ssid));
+    const size_t pass_len = (password != NULL) ? strnlen(password, sizeof(((wifi_sta_config_t *)0)->password)) : 0;
+    if(ssid_len == 0 || ssid_len >= sizeof(((wifi_sta_config_t *)0)->ssid)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if(pass_len >= sizeof(((wifi_sta_config_t *)0)->password)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    wifi_config_t sta_cfg = {0};
+    memcpy(sta_cfg.sta.ssid, ssid, ssid_len);
+    if(password != NULL && password[0] != '\0') {
+        strlcpy((char *)sta_cfg.sta.password, password, sizeof(sta_cfg.sta.password));
+    }
+
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Manual credential apply: failed to set APSTA mode (err=%d)", ret);
+        return ret;
+    }
+
+    ret = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Manual credential apply: failed to set Wi-Fi storage (err=%d)", ret);
+        return ret;
+    }
+
+    ret = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Manual credential apply: failed to set STA config (err=%d)", ret);
+        return ret;
+    }
+
+    /* Manual provisioning fallback bypasses protocomm flow, so enable normal STA
+     * reconnect behavior immediately. */
+    wifi_is_provisioning = false;
+
+    ret = esp_wifi_connect();
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Manual credential apply: failed to trigger STA connect (err=%d)", ret);
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "Manual credential apply accepted for SSID: %s", ssid);
+    return ESP_OK;
+}
+
+static bool diag_parse_form_field(const char *body, const char *key, char *out, size_t out_len)
+{
+    if(body == NULL || key == NULL || out == NULL || out_len == 0) {
+        return false;
+    }
+
+    const size_t key_len = strlen(key);
+    const char *match = strstr(body, key);
+    if(match == NULL || match[key_len] != '=') {
+        return false;
+    }
+
+    match += key_len + 1;
+    size_t w = 0;
+    while(*match != '\0' && *match != '&' && w + 1 < out_len) {
+        if(*match == '+') {
+            out[w++] = ' ';
+        } else if(*match == '%' && isxdigit((unsigned char)match[1]) && isxdigit((unsigned char)match[2])) {
+            char hex[3] = { match[1], match[2], '\0' };
+            out[w++] = (char)strtol(hex, NULL, 16);
+            match += 2;
+        } else {
+            out[w++] = *match;
+        }
+        match++;
+    }
+    out[w] = '\0';
+    return w > 0 || (key_len > 0 && strcmp(key, "password") == 0);
 }
 
 static esp_err_t prov_diag_post_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Provisioning diag POST hit: %s (len=%d)", req->uri, req->content_len);
+
+    if(req->content_len <= 0 || req->content_len > 512) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"invalid_content_length\"}");
+    }
+
+    char body[513] = {0};
+    int total_read = 0;
+    while(total_read < req->content_len) {
+        int r = httpd_req_recv(req, body + total_read, req->content_len - total_read);
+        if(r <= 0) {
+            httpd_resp_set_status(req, "408 Request Timeout");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"recv_failed\"}");
+        }
+        total_read += r;
+    }
+    body[total_read] = '\0';
+
+    char ssid[33] = {0};
+    char password[65] = {0};
+    const char *ssid_ptr = NULL;
+    const char *password_ptr = NULL;
+
+    cJSON *root = cJSON_Parse(body);
+    if(root != NULL) {
+        const cJSON *ssid_item = cJSON_GetObjectItemCaseSensitive(root, "ssid");
+        const cJSON *password_item = cJSON_GetObjectItemCaseSensitive(root, "password");
+        if(password_item == NULL) {
+            password_item = cJSON_GetObjectItemCaseSensitive(root, "passphrase");
+        }
+        if(cJSON_IsString(ssid_item)) {
+            ssid_ptr = ssid_item->valuestring;
+        }
+        if(cJSON_IsString(password_item)) {
+            password_ptr = password_item->valuestring;
+        }
+        cJSON_Delete(root);
+    }
+
+    if(ssid_ptr == NULL) {
+        if(!diag_parse_form_field(body, "ssid", ssid, sizeof(ssid))) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"missing_ssid\"}");
+        }
+        ssid_ptr = ssid;
+    }
+    if(password_ptr == NULL) {
+        if(diag_parse_form_field(body, "password", password, sizeof(password))) {
+            password_ptr = password;
+        } else if(diag_parse_form_field(body, "passphrase", password, sizeof(password))) {
+            password_ptr = password;
+        } else {
+            password_ptr = "";
+        }
+    }
+
+    esp_err_t apply_ret = wifi_apply_manual_credentials(ssid_ptr, password_ptr);
+
+    if(apply_ret != ESP_OK) {
+        char resp[96] = {0};
+        snprintf(resp, sizeof(resp), "{\"ok\":false,\"error\":\"apply_failed\",\"code\":%d}", (int)apply_ret);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, resp);
+    }
+
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"ok\":true,\"method\":\"post\"}");
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"mode\":\"manual_wifi_apply\"}");
 }
 
 static esp_err_t prov_httpd_err_handler(httpd_req_t *req, httpd_err_code_t error)
@@ -448,6 +627,20 @@ static esp_err_t prov_httpd_err_handler(httpd_req_t *req, httpd_err_code_t error
     }
     return ESP_FAIL;
 }
+
+static const httpd_uri_t prov_root_get_uri = {
+    .uri      = "/",
+    .method   = HTTP_GET,
+    .handler  = prov_diag_get_handler,
+    .user_ctx = NULL
+};
+
+static const httpd_uri_t prov_root_post_uri = {
+    .uri      = "/",
+    .method   = HTTP_POST,
+    .handler  = prov_diag_post_handler,
+    .user_ctx = NULL
+};
 
 static const httpd_uri_t prov_captive_portal_uri = {
     .uri      = "/*",          /* wildcard: catches /generate_204 and friends */
@@ -588,6 +781,7 @@ static esp_err_t wifi_start_softap_provisioning(void)
     security_ver = 0;
     security_params = NULL;
     security_label = "sec0";
+    pop = NULL;
 #else
 #error "At least one protocomm security version must be enabled"
 #endif

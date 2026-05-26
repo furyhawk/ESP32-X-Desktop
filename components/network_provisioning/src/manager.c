@@ -314,11 +314,8 @@ static cJSON *network_prov_get_info_json(void)
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_WIFI
     /* Indicate capability for performing Wi-Fi provision */
     cJSON_AddItemToArray(prov_capabilities, cJSON_CreateString("wifi_prov"));
-    /* Keep Wi-Fi scan capability for compatibility with provisioning apps
-     * that require it in their save/apply flow, even when scan results may be empty. */
-    cJSON_AddItemToArray(prov_capabilities, cJSON_CreateString("wifi_scan"));
-    /* Indicate that client should allow manual SSID/password entry instead of
-     * relying on AP scan results. */
+    /* Manual-entry provisioning mode: do not advertise wifi_scan capability
+     * because scan may return an empty list in SoftAP provisioning scenarios. */
     cJSON_AddItemToArray(prov_capabilities, cJSON_CreateString("no_scan"));
 #endif
 #ifdef CONFIG_NETWORK_PROV_NETWORK_TYPE_THREAD
