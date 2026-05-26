@@ -5,7 +5,13 @@ dependencies:
   idf:
     version: '>=4.1.0'
   lvgl/lvgl: ^9.5.0
+  espressif/esp_codec_dev:
+    version: ~1.4.0
+    override_path: ../components/esp_codec_dev
   waveshare/esp_lcd_touch_cst9217: ^1.0.4
   waveshare/pcf85063a: ^1.1.1
+  waveshare/qmi8658: ^1.0.1
   espressif/esp_lvgl_adapter: ^0.3.0
-  espressif/network_provisioning: "*"
+  espressif/network_provisioning:
+    version: "*"
+    override_path: ../components/network_provisioning

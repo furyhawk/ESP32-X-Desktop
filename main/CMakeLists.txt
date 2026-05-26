@@ -1,5 +1,21 @@
 idf_component_register(
-    SRCS "main.cpp"
-         "desktop_ui.cpp"
-         "wifi_provisioning.cpp"
-    INCLUDE_DIRS ".")
+    SRCS "app/app_main.cpp"
+         "modules/desktop_ui/desktop_ui.cpp"
+         "modules/wifi_provisioning/wifi_provisioning.cpp"
+    REQUIRES
+         audio_bsp
+         app_bsp
+         pmicpower
+         spi_flash
+         esp_psram
+         nvs_flash
+         esp_http_client
+         esp_http_server
+         espressif__cjson
+         mbedtls
+    EMBED_TXTFILES
+         "certs/temp_api_ca_chain.pem"
+    INCLUDE_DIRS "."
+                 "app"
+                 "modules/desktop_ui"
+                 "modules/wifi_provisioning")

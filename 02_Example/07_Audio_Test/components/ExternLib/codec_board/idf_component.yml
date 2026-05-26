@@ -3,7 +3,9 @@ dependencies:
     rules:
     - if: target in [esp32p4]
     version: ~1.0.2
-  espressif/esp_codec_dev: ~1.4.0
+  espressif/esp_codec_dev:
+    version: ~1.4.0
+    override_path: ../../../../../components/esp_codec_dev
   espressif/esp_lcd_ili9881c:
     rules:
     - if: target in [esp32p4]

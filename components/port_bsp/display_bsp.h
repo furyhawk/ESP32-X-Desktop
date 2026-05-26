@@ -23,6 +23,7 @@ private:
     int tp_reset_;
     bool is_touchinitialized_ = false;
     uint8_t brightness_ = 100;
+    uint8_t current_rotation_ = 0;
 
     int DisplayPort_DispReset(void);
 public:
