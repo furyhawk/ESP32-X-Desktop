@@ -416,6 +416,29 @@ static void wifi_prov_print_url(const char *name,
 static esp_err_t prov_captive_portal_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Captive portal probe intercepted: %s", req->uri);
+
+    /* Android's connectivity service hits /generate_204 (and /gen_204) and
+     * expects an exact HTTP 204 response.  Returning anything else (e.g. a
+     * redirect) causes Android to classify the SoftAP as a captive portal and
+     * force-disconnect the client after a short timeout — before the
+     * provisioning app has a chance to exchange credentials.
+     *
+     * Apple's CNA hits /hotspot-detect.html and expects a 200 with "Success".
+     *
+     * For all other unknown probes we fall through to a /diag redirect so that
+     * a manual browser-based flow still works. */
+    const char *uri = req->uri;
+    if(strstr(uri, "generate_204") != NULL || strstr(uri, "gen_204") != NULL) {
+        httpd_resp_set_status(req, "204 No Content");
+        return httpd_resp_send(req, NULL, 0);
+    }
+
+    if(strstr(uri, "hotspot-detect") != NULL || strstr(uri, "success.txt") != NULL
+       || strstr(uri, "ncsi.txt") != NULL || strstr(uri, "connecttest") != NULL) {
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_sendstr(req, "Success");
+    }
+
     httpd_resp_set_status(req, "302 Found");
     httpd_resp_set_hdr(req, "Location", "/diag");
     httpd_resp_set_type(req, "text/html");
