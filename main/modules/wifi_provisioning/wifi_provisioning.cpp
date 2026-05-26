@@ -704,6 +704,24 @@ static esp_err_t wifi_prov_manager_init_if_needed(void)
         }
         ESP_LOGI(TAG, "Provisioning diag endpoint registered: POST /diag");
 
+        httpd_ret = httpd_register_uri_handler(prov_httpd_handle, &prov_root_get_uri);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register / GET handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+        ESP_LOGI(TAG, "Provisioning root endpoint registered: GET /");
+
+        httpd_ret = httpd_register_uri_handler(prov_httpd_handle, &prov_root_post_uri);
+        if(httpd_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to register / POST handler (error: %d)", httpd_ret);
+            httpd_stop(prov_httpd_handle);
+            prov_httpd_handle = NULL;
+            return httpd_ret;
+        }
+        ESP_LOGI(TAG, "Provisioning root endpoint registered: POST /");
+
         /* Register wildcard GET handler for Android captive-portal detection. */
         httpd_ret = httpd_register_uri_handler(prov_httpd_handle, &prov_captive_portal_uri);
         if(httpd_ret != ESP_OK) {
